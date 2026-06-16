@@ -170,6 +170,10 @@ export type WSMessageType =
   | 'viewport_update'
   | 'cursor_update'
   | 'elements_in_viewport'
+  | 'viewport_diff'
+  | 'create_element'
+  | 'create_element_response'
+  | 'elements_removed'
   | 'user_joined'
   | 'user_left'
   | 'sync_ack'
@@ -219,4 +223,45 @@ export interface SyncAckMessage {
   accepted: boolean;
   reason?: string;
   serverVersion?: number;
+}
+
+export type ElementCreateInput =
+  | Omit<RectangleElement, 'id' | 'zIndex' | 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy' | 'version'>
+  | Omit<CircleElement, 'id' | 'zIndex' | 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy' | 'version'>
+  | Omit<LineElement, 'id' | 'zIndex' | 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy' | 'version'>
+  | Omit<TextElement, 'id' | 'zIndex' | 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy' | 'version'>
+  | Omit<PathElement, 'id' | 'zIndex' | 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy' | 'version'>
+  | Omit<ImageElement, 'id' | 'zIndex' | 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy' | 'version'>;
+
+export interface CreateElementMessage {
+  roomId: string;
+  element: ElementCreateInput;
+  requestId?: string;
+}
+
+export interface CreateElementResponse {
+  success: boolean;
+  element?: WhiteboardElement;
+  requestId?: string;
+  error?: string;
+}
+
+export interface ViewportDiffMessage {
+  viewport: Viewport;
+  added: WhiteboardElement[];
+  removed: string[];
+  updated: WhiteboardElement[];
+  timestamp: number;
+}
+
+export interface ElementsRemovedMessage {
+  elementIds: string[];
+  reason?: 'moved_out' | 'deleted';
+  timestamp: number;
+}
+
+export interface ElementsAddedMessage {
+  elements: WhiteboardElement[];
+  reason?: 'moved_in' | 'created';
+  timestamp: number;
 }

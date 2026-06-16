@@ -1,37 +1,42 @@
-import { WhiteboardElement, Rect } from './types';
+import { WhiteboardElement, Rect, ElementCreateInput } from './types';
 import { QuadTree } from './quadtree';
 
 export class SnowflakeIdGenerator {
-  private epoch: number = 1609459200000;
-  private workerId: number;
-  private datacenterId: number;
-  private sequence: number = 0;
-  private lastTimestamp: number = -1;
+  private epoch: bigint = 1609459200000n;
+  private workerId: bigint;
+  private datacenterId: bigint;
+  private sequence: bigint = 0n;
+  private lastTimestamp: bigint = -1n;
 
-  private readonly workerIdBits: number = 5;
-  private readonly datacenterIdBits: number = 5;
-  private readonly sequenceBits: number = 12;
+  private readonly workerIdBits: bigint = 5n;
+  private readonly datacenterIdBits: bigint = 5n;
+  private readonly sequenceBits: bigint = 12n;
 
-  private readonly maxWorkerId: number = -1 ^ (-1 << this.workerIdBits);
-  private readonly maxDatacenterId: number = -1 ^ (-1 << this.datacenterIdBits);
-  private readonly sequenceMask: number = -1 ^ (-1 << this.sequenceBits);
+  private readonly maxWorkerId: bigint = ~(-1n << this.workerIdBits);
+  private readonly maxDatacenterId: bigint = ~(-1n << this.datacenterIdBits);
+  private readonly sequenceMask: bigint = ~(-1n << this.sequenceBits);
 
-  private readonly workerIdShift: number = this.sequenceBits;
-  private readonly datacenterIdShift: number = this.sequenceBits + this.workerIdBits;
-  private readonly timestampShift: number = this.sequenceBits + this.workerIdBits + this.datacenterIdBits;
+  private readonly workerIdShift: bigint = this.sequenceBits;
+  private readonly datacenterIdShift: bigint = this.sequenceBits + this.workerIdBits;
+  private readonly timestampShift: bigint = this.sequenceBits + this.workerIdBits + this.datacenterIdBits;
+
+  private generatedIds: Set<string> = new Set();
 
   constructor(workerId: number = 0, datacenterId: number = 0) {
-    if (workerId > this.maxWorkerId || workerId < 0) {
+    const workerIdBig = BigInt(workerId);
+    const datacenterIdBig = BigInt(datacenterId);
+
+    if (workerIdBig > this.maxWorkerId || workerIdBig < 0n) {
       throw new Error(`workerId must be between 0 and ${this.maxWorkerId}`);
     }
-    if (datacenterId > this.maxDatacenterId || datacenterId < 0) {
+    if (datacenterIdBig > this.maxDatacenterId || datacenterIdBig < 0n) {
       throw new Error(`datacenterId must be between 0 and ${this.maxDatacenterId}`);
     }
-    this.workerId = workerId;
-    this.datacenterId = datacenterId;
+    this.workerId = workerIdBig;
+    this.datacenterId = datacenterIdBig;
   }
 
-  private tilNextMillis(lastTimestamp: number): number {
+  private tilNextMillis(lastTimestamp: bigint): bigint {
     let timestamp = this.currentTimestamp();
     while (timestamp <= lastTimestamp) {
       timestamp = this.currentTimestamp();
@@ -39,35 +44,50 @@ export class SnowflakeIdGenerator {
     return timestamp;
   }
 
-  private currentTimestamp(): number {
-    return Date.now();
+  private currentTimestamp(): bigint {
+    return BigInt(Date.now());
   }
 
   nextId(): string {
     let timestamp = this.currentTimestamp();
 
     if (timestamp < this.lastTimestamp) {
-      throw new Error('Clock moved backwards. Refusing to generate id');
+      timestamp = this.tilNextMillis(this.lastTimestamp);
     }
 
     if (timestamp === this.lastTimestamp) {
-      this.sequence = (this.sequence + 1) & this.sequenceMask;
-      if (this.sequence === 0) {
+      this.sequence = (this.sequence + 1n) & this.sequenceMask;
+      if (this.sequence === 0n) {
         timestamp = this.tilNextMillis(this.lastTimestamp);
       }
     } else {
-      this.sequence = 0;
+      this.sequence = 0n;
     }
 
     this.lastTimestamp = timestamp;
 
-    const id =
+    const idBigInt =
       ((timestamp - this.epoch) << this.timestampShift) |
       (this.datacenterId << this.datacenterIdShift) |
       (this.workerId << this.workerIdShift) |
       this.sequence;
 
-    return id.toString();
+    const id = idBigInt.toString();
+
+    if (this.generatedIds.has(id)) {
+      return this.nextId();
+    }
+    this.generatedIds.add(id);
+
+    if (this.generatedIds.size > 1000000) {
+      this.generatedIds.clear();
+    }
+
+    return id;
+  }
+
+  isIdGenerated(id: string): boolean {
+    return this.generatedIds.has(id);
   }
 }
 
@@ -78,11 +98,19 @@ export class ElementManager {
   private maxZIndex: number = 0;
   private zIndexCounter: number = 0;
 
+  private readonly DEFAULT_BOUNDS: Rect = {
+    x: -100000000,
+    y: -100000000,
+    width: 200000000,
+    height: 200000000,
+  };
+
   constructor(
-    canvasBounds: Rect = { x: -1000000, y: -1000000, width: 2000000, height: 2000000 },
+    canvasBounds?: Rect,
     workerId: number = 0
   ) {
-    this.quadtree = new QuadTree(canvasBounds);
+    const bounds = canvasBounds || this.DEFAULT_BOUNDS;
+    this.quadtree = new QuadTree(bounds, 10, 12);
     this.idGenerator = new SnowflakeIdGenerator(workerId);
   }
 
@@ -94,6 +122,40 @@ export class ElementManager {
     this.zIndexCounter++;
     this.maxZIndex = Math.max(this.maxZIndex, this.zIndexCounter);
     return this.zIndexCounter;
+  }
+
+  createElement(
+    input: ElementCreateInput,
+    userId: string
+  ): WhiteboardElement {
+    const id = this.generateId();
+    const zIndex = this.getNextZIndex();
+    const now = Date.now();
+
+    const element = {
+      ...input,
+      id,
+      zIndex,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: userId,
+      updatedBy: userId,
+      version: 1,
+    } as WhiteboardElement;
+
+    if (this.elements.has(element.id)) {
+      throw new Error(`Element with id ${element.id} already exists`);
+    }
+
+    if (element.zIndex > this.maxZIndex) {
+      this.maxZIndex = element.zIndex;
+      this.zIndexCounter = element.zIndex;
+    }
+
+    this.elements.set(element.id, element);
+    this.quadtree.insert(element);
+
+    return element;
   }
 
   addElement(element: WhiteboardElement): WhiteboardElement {
@@ -182,6 +244,10 @@ export class ElementManager {
     });
   }
 
+  moveElementTo(id: string, newX: number, newY: number): WhiteboardElement | null {
+    return this.updateElement(id, { x: newX, y: newY });
+  }
+
   resizeElement(id: string, newWidth: number, newHeight: number): WhiteboardElement | null {
     return this.updateElement(id, {
       width: newWidth,
@@ -211,6 +277,14 @@ export class ElementManager {
 
   getMaxZIndex(): number {
     return this.maxZIndex;
+  }
+
+  getIdGenerator(): SnowflakeIdGenerator {
+    return this.idGenerator;
+  }
+
+  getQuadtree(): QuadTree {
+    return this.quadtree;
   }
 
   clear(): void {

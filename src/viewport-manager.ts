@@ -1,4 +1,4 @@
-import { Viewport, Rect, WhiteboardElement } from './types';
+import { Viewport, Rect, WhiteboardElement, ViewportDiffMessage } from './types';
 import { ElementManager } from './element-manager';
 
 export interface ViewportChange {
@@ -14,10 +14,19 @@ export interface ViewportElements {
   timestamp: number;
 }
 
+export interface ElementViewportChange {
+  element: WhiteboardElement;
+  oldRect: Rect;
+  newRect: Rect;
+  usersEntering: string[];
+  usersLeaving: string[];
+  usersStaying: string[];
+}
+
 export class ViewportManager {
   private elementManager: ElementManager;
   private userViewports: Map<string, Viewport> = new Map();
-  private userElementIds: Map<string, Set<string>> = new Map();
+  private userElementVersions: Map<string, Map<string, number>> = new Map();
 
   private readonly viewportMarginRatio: number = 0.2;
   private readonly updateThreshold: number = 50;
@@ -31,7 +40,7 @@ export class ViewportManager {
 
     if (!oldViewport) {
       this.userViewports.set(userId, { ...viewport });
-      this.userElementIds.set(userId, new Set());
+      this.userElementVersions.set(userId, new Map());
       return null;
     }
 
@@ -61,7 +70,7 @@ export class ViewportManager {
 
   removeUser(userId: string): void {
     this.userViewports.delete(userId);
-    this.userElementIds.delete(userId);
+    this.userElementVersions.delete(userId);
   }
 
   getElementsInViewport(viewport: Viewport): WhiteboardElement[] {
@@ -86,8 +95,13 @@ export class ViewportManager {
     if (!viewport) return null;
 
     const elements = this.getElementsInViewport(viewport);
-    const elementIds = new Set(elements.map((e) => e.id));
-    this.userElementIds.set(userId, elementIds);
+    const versionMap = this.userElementVersions.get(userId) || new Map();
+
+    versionMap.clear();
+    for (const element of elements) {
+      versionMap.set(element.id, element.version);
+    }
+    this.userElementVersions.set(userId, versionMap);
 
     return {
       viewport: { ...viewport },
@@ -96,33 +110,147 @@ export class ViewportManager {
     };
   }
 
-  getViewportDiff(userId: string, newElements: WhiteboardElement[]): {
-    added: WhiteboardElement[];
-    removed: string[];
-    updated: WhiteboardElement[];
-  } {
-    const previousIds = this.userElementIds.get(userId) || new Set<string>();
-    const newIds = new Set(newElements.map((e) => e.id));
+  getViewportDiffForUser(userId: string): ViewportDiffMessage | null {
+    const viewport = this.userViewports.get(userId);
+    if (!viewport) return null;
 
+    const newElements = this.getElementsInViewport(viewport);
+    const previousVersions = this.userElementVersions.get(userId) || new Map();
+
+    const newIds = new Set(newElements.map((e) => e.id));
     const added: WhiteboardElement[] = [];
     const removed: string[] = [];
     const updated: WhiteboardElement[] = [];
 
     for (const element of newElements) {
-      if (!previousIds.has(element.id)) {
+      const prevVersion = previousVersions.get(element.id);
+      if (prevVersion === undefined) {
         added.push(element);
-      } else {
+      } else if (element.version > prevVersion) {
         updated.push(element);
       }
     }
 
-    for (const id of previousIds) {
+    for (const [id] of previousVersions) {
       if (!newIds.has(id)) {
         removed.push(id);
       }
     }
 
-    return { added, removed, updated };
+    const newVersions = new Map<string, number>();
+    for (const element of newElements) {
+      newVersions.set(element.id, element.version);
+    }
+    this.userElementVersions.set(userId, newVersions);
+
+    if (added.length === 0 && removed.length === 0 && updated.length === 0) {
+      return null;
+    }
+
+    return {
+      viewport: { ...viewport },
+      added,
+      removed,
+      updated,
+      timestamp: Date.now(),
+    };
+  }
+
+  calculateElementMoveChange(
+    element: WhiteboardElement,
+    oldRect: Rect,
+    newRect: Rect
+  ): ElementViewportChange {
+    const usersEntering: string[] = [];
+    const usersLeaving: string[] = [];
+    const usersStaying: string[] = [];
+
+    for (const [userId, viewport] of this.userViewports) {
+      const expanded = this.expandViewport(viewport);
+      const wasIn = this.rectsIntersect(oldRect, expanded);
+      const isIn = this.rectsIntersect(newRect, expanded);
+
+      if (!wasIn && isIn) {
+        usersEntering.push(userId);
+      } else if (wasIn && !isIn) {
+        usersLeaving.push(userId);
+      } else if (wasIn && isIn) {
+        usersStaying.push(userId);
+      }
+    }
+
+    return {
+      element,
+      oldRect,
+      newRect,
+      usersEntering,
+      usersLeaving,
+      usersStaying,
+    };
+  }
+
+  onElementMoved(
+    userId: string,
+    element: WhiteboardElement,
+    oldRect: Rect,
+    newRect: Rect
+  ): ElementViewportChange {
+    const change = this.calculateElementMoveChange(element, oldRect, newRect);
+
+    for (const uid of change.usersEntering) {
+      const versions = this.userElementVersions.get(uid);
+      if (versions) {
+        versions.set(element.id, element.version);
+      }
+    }
+
+    for (const uid of change.usersLeaving) {
+      const versions = this.userElementVersions.get(uid);
+      if (versions) {
+        versions.delete(element.id);
+      }
+    }
+
+    return change;
+  }
+
+  onElementCreated(element: WhiteboardElement): string[] {
+    const usersInArea = this.getUsersInElementArea(element);
+
+    for (const userId of usersInArea) {
+      const versions = this.userElementVersions.get(userId);
+      if (versions) {
+        versions.set(element.id, element.version);
+      }
+    }
+
+    return usersInArea;
+  }
+
+  onElementDeleted(elementId: string, elementRect: Rect): string[] {
+    const usersInArea = this.getUsersInRect(elementRect);
+
+    for (const userId of usersInArea) {
+      const versions = this.userElementVersions.get(userId);
+      if (versions) {
+        versions.delete(elementId);
+      }
+    }
+
+    return usersInArea;
+  }
+
+  onElementUpdated(element: WhiteboardElement): string[] {
+    const usersInArea = this.getUsersInElementArea(element);
+
+    for (const userId of usersInArea) {
+      const versions = this.userElementVersions.get(userId);
+      if (versions) {
+        versions.set(element.id, element.version);
+      }
+    }
+
+    return usersInArea;
   }
 
   getUsersInElementArea(element: WhiteboardElement): string[] {
@@ -193,6 +321,16 @@ export class ViewportManager {
     };
   }
 
+  getUserElementIds(userId: string): Set<string> {
+    const versions = this.userElementVersions.get(userId);
+    return versions ? new Set(versions.keys()) : new Set();
+  }
+
+  hasUserElement(userId: string, elementId: string): boolean {
+    const versions = this.userElementVersions.get(userId);
+    return versions ? versions.has(elementId) : false;
+  }
+
   getUserCount(): number {
     return this.userViewports.size;
   }
@@ -203,6 +341,6 @@ export class ViewportManager {
 
   clear(): void {
     this.userViewports.clear();
-    this.userElementIds.clear();
+    this.userElementVersions.clear();
   }
 }

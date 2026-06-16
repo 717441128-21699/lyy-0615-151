@@ -7,6 +7,7 @@ import {
   UpdateOperation,
   ReorderOperation,
   ResizeOperation,
+  Rect,
 } from './types';
 import { ElementManager } from './element-manager';
 
@@ -17,6 +18,9 @@ export interface OperationResult {
   error?: string;
   needsTransform?: boolean;
   transformedOperation?: WhiteboardOperation;
+  oldRect?: Rect;
+  newRect?: Rect;
+  operationType?: 'create' | 'delete' | 'move' | 'resize' | 'update' | 'reorder';
 }
 
 export class OperationProcessor {
@@ -56,6 +60,7 @@ export class OperationProcessor {
         success: false,
         operation: op,
         error: 'Element with this ID already exists',
+        operationType: 'create',
       };
     }
 
@@ -64,7 +69,20 @@ export class OperationProcessor {
 
     this.addToHistory(op);
 
-    return { success: true, operation: op, element: result };
+    const newRect: Rect = {
+      x: result.x,
+      y: result.y,
+      width: result.width,
+      height: result.height,
+    };
+
+    return {
+      success: true,
+      operation: op,
+      element: result,
+      newRect,
+      operationType: 'create',
+    };
   }
 
   private processDelete(op: DeleteOperation): OperationResult {
@@ -74,6 +92,7 @@ export class OperationProcessor {
         success: false,
         operation: op,
         error: 'Element not found',
+        operationType: 'delete',
       };
     }
 
@@ -83,17 +102,31 @@ export class OperationProcessor {
         operation: op,
         error: 'Version conflict',
         needsTransform: true,
+        operationType: 'delete',
       };
     }
+
+    const oldRect: Rect = {
+      x: element.x,
+      y: element.y,
+      width: element.width,
+      height: element.height,
+    };
 
     const success = this.elementManager.deleteElement(op.elementId);
 
     if (success) {
       this.addToHistory(op);
-      return { success: true, operation: op, element };
+      return {
+        success: true,
+        operation: op,
+        element,
+        oldRect,
+        operationType: 'delete',
+      };
     }
 
-    return { success: false, operation: op, error: 'Delete failed' };
+    return { success: false, operation: op, error: 'Delete failed', operationType: 'delete' };
   }
 
   private processMove(op: MoveOperation): OperationResult {
@@ -103,26 +136,48 @@ export class OperationProcessor {
         success: false,
         operation: op,
         error: 'Element not found',
+        operationType: 'move',
       };
     }
 
+    const oldRect: Rect = {
+      x: element.x,
+      y: element.y,
+      width: element.width,
+      height: element.height,
+    };
+
     if (op.version > 0 && op.version !== element.version) {
-      return this.transformMoveOperation(op, element);
+      return this.transformMoveOperation(op, element, oldRect);
     }
 
     const result = this.elementManager.moveElement(op.elementId, op.dx, op.dy);
 
     if (result) {
       this.addToHistory(op);
-      return { success: true, operation: op, element: result };
+      const newRect: Rect = {
+        x: result.x,
+        y: result.y,
+        width: result.width,
+        height: result.height,
+      };
+      return {
+        success: true,
+        operation: op,
+        element: result,
+        oldRect,
+        newRect,
+        operationType: 'move',
+      };
     }
 
-    return { success: false, operation: op, error: 'Move failed' };
+    return { success: false, operation: op, error: 'Move failed', operationType: 'move' };
   }
 
   private transformMoveOperation(
     op: MoveOperation,
-    currentElement: WhiteboardElement
+    currentElement: WhiteboardElement,
+    oldRect: Rect
   ): OperationResult {
     const transformedOp: MoveOperation = {
       ...op,
@@ -138,15 +193,24 @@ export class OperationProcessor {
 
     if (result) {
       this.addToHistory(transformedOp);
+      const newRect: Rect = {
+        x: result.x,
+        y: result.y,
+        width: result.width,
+        height: result.height,
+      };
       return {
         success: true,
         operation: transformedOp,
         element: result,
         transformedOperation: transformedOp,
+        oldRect,
+        newRect,
+        operationType: 'move',
       };
     }
 
-    return { success: false, operation: op, error: 'Transform move failed' };
+    return { success: false, operation: op, error: 'Transform move failed', operationType: 'move' };
   }
 
   private processResize(op: ResizeOperation): OperationResult {

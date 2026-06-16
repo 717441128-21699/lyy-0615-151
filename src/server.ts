@@ -7,6 +7,7 @@ import {
   BatchOperationMessage,
   ViewportUpdateMessage,
   CursorUpdateMessage,
+  CreateElementMessage,
   WSMessageType,
 } from './types';
 import { Room } from './room';
@@ -125,6 +126,9 @@ export class WhiteboardServer {
         break;
       case 'cursor_update':
         this.handleCursorUpdate(client, message.data as CursorUpdateMessage);
+        break;
+      case 'create_element':
+        this.handleCreateElement(client, message.data as CreateElementMessage);
         break;
       default:
         this.sendToClient(client.id, {
@@ -256,6 +260,37 @@ export class WhiteboardServer {
     if (!room) return;
 
     room.handleCursorUpdate(client.userId, data.position);
+  }
+
+  private handleCreateElement(client: ClientConnection, data: CreateElementMessage): void {
+    if (!client.roomId || !client.userId) {
+      this.sendToClient(client.id, {
+        type: 'create_element_response',
+        data: {
+          success: false,
+          requestId: data.requestId,
+          error: 'Not joined a room',
+        },
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
+    const room = this.rooms.get(client.roomId);
+    if (!room) {
+      this.sendToClient(client.id, {
+        type: 'create_element_response',
+        data: {
+          success: false,
+          requestId: data.requestId,
+          error: 'Room not found',
+        },
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
+    room.handleCreateElement(client.userId, data);
   }
 
   private handleDisconnect(clientId: string): void {

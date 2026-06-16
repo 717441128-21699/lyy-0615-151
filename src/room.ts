@@ -4,10 +4,17 @@ import {
   WhiteboardElement,
   WhiteboardOperation,
   WSMessage,
+  ElementCreateInput,
+  CreateElementMessage,
+  CreateElementResponse,
+  ViewportDiffMessage,
+  ElementsRemovedMessage,
+  Rect,
+  MoveOperation,
 } from './types';
 import { ElementManager } from './element-manager';
 import { OperationProcessor, OperationResult } from './operation-processor';
-import { ViewportManager } from './viewport-manager';
+import { ViewportManager, ElementViewportChange } from './viewport-manager';
 import { OperationBatcher } from './operation-batcher';
 
 export type BroadcastCallback = (
@@ -119,6 +126,52 @@ export class Room {
     return this.users.size;
   }
 
+  handleCreateElement(userId: string, message: CreateElementMessage): void {
+    try {
+      const element = this.elementManager.createElement(message.element, userId);
+
+      const usersToNotify = this.viewportManager.onElementCreated(element);
+
+      this.sendToUserCallback(userId, {
+        type: 'create_element_response',
+        data: {
+          success: true,
+          element,
+          requestId: message.requestId,
+        } as CreateElementResponse,
+        timestamp: Date.now(),
+      });
+
+      for (const uid of usersToNotify) {
+        if (uid !== userId) {
+          this.sendToUserCallback(uid, {
+            type: 'operation',
+            data: {
+              type: 'create',
+              id: element.id,
+              elementId: element.id,
+              element,
+              userId,
+              timestamp: Date.now(),
+              version: element.version,
+            },
+            timestamp: Date.now(),
+          });
+        }
+      }
+    } catch (error) {
+      this.sendToUserCallback(userId, {
+        type: 'create_element_response',
+        data: {
+          success: false,
+          requestId: message.requestId,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        } as CreateElementResponse,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
   handleOperation(userId: string, operation: WhiteboardOperation): void {
     this.operationBatcher.addOperation(userId, operation);
   }
@@ -147,15 +200,12 @@ export class Room {
     const change = this.viewportManager.setUserViewport(userId, viewport);
 
     if (change) {
-      const elementsData = this.viewportManager.getElementsForUser(userId);
-      if (elementsData) {
+      const diff = this.viewportManager.getViewportDiffForUser(userId);
+
+      if (diff) {
         this.sendToUserCallback(userId, {
-          type: 'elements_in_viewport',
-          data: {
-            elements: elementsData.elements,
-            viewport: elementsData.viewport,
-            timestamp: elementsData.timestamp,
-          },
+          type: 'viewport_diff',
+          data: diff as ViewportDiffMessage,
           timestamp: Date.now(),
         });
       }
@@ -194,32 +244,145 @@ export class Room {
 
     if (successfulResults.length === 0) return;
 
-    const affectedUserIds = new Set<string>();
-
     for (const result of successfulResults) {
-      if (result.element) {
-        const users = this.viewportManager.getUsersInElementArea(result.element);
-        users.forEach((uid) => {
-          if (uid !== sourceUserId) {
-            affectedUserIds.add(uid);
-          }
-        });
+      if (!result.element || !result.operationType) continue;
+
+      switch (result.operationType) {
+        case 'create':
+          this.handleCreateBroadcast(result, sourceUserId);
+          break;
+        case 'delete':
+          this.handleDeleteBroadcast(result, sourceUserId);
+          break;
+        case 'move':
+          this.handleMoveBroadcast(result, sourceUserId);
+          break;
+        case 'resize':
+        case 'update':
+        case 'reorder':
+          this.handleUpdateBroadcast(result, sourceUserId);
+          break;
       }
     }
+  }
 
-    const operations = successfulResults
-      .map((r) => r.operation)
-      .filter((op): op is WhiteboardOperation => op !== undefined);
+  private handleCreateBroadcast(result: OperationResult, sourceUserId: string): void {
+    if (!result.element || !result.newRect) return;
 
-    if (affectedUserIds.size > 0 && operations.length > 0) {
-      const message: WSMessage = {
-        type: operations.length === 1 ? 'operation' : 'batch_operation',
-        data: operations.length === 1 ? operations[0] : { operations },
+    const usersToNotify = this.viewportManager.onElementCreated(result.element);
+
+    const message: WSMessage = {
+      type: 'operation',
+      data: result.operation,
+      timestamp: Date.now(),
+    };
+
+    for (const uid of usersToNotify) {
+      if (uid !== sourceUserId) {
+        this.sendToUserCallback(uid, message);
+      }
+    }
+  }
+
+  private handleDeleteBroadcast(result: OperationResult, sourceUserId: string): void {
+    if (!result.element || !result.oldRect) return;
+
+    const usersToNotify = this.viewportManager.onElementDeleted(result.element.id, result.oldRect);
+
+    const removeMessage: WSMessage = {
+      type: 'elements_removed',
+      data: {
+        elementIds: [result.element.id],
+        reason: 'deleted',
+        timestamp: Date.now(),
+      } as ElementsRemovedMessage,
+      timestamp: Date.now(),
+    };
+
+    for (const uid of usersToNotify) {
+      if (uid !== sourceUserId) {
+        this.sendToUserCallback(uid, removeMessage);
+      }
+    }
+  }
+
+  private handleMoveBroadcast(result: OperationResult, sourceUserId: string): void {
+    if (!result.element || !result.oldRect || !result.newRect) return;
+
+    const viewportChange = this.viewportManager.onElementMoved(
+      sourceUserId,
+      result.element,
+      result.oldRect,
+      result.newRect
+    );
+
+    const moveOp = result.operation as MoveOperation;
+
+    if (viewportChange.usersLeaving.length > 0) {
+      const removeMessage: WSMessage = {
+        type: 'elements_removed',
+        data: {
+          elementIds: [result.element.id],
+          reason: 'moved_out',
+          timestamp: Date.now(),
+        } as ElementsRemovedMessage,
         timestamp: Date.now(),
       };
 
-      for (const userId of affectedUserIds) {
-        this.sendToUserCallback(userId, message);
+      for (const uid of viewportChange.usersLeaving) {
+        if (uid !== sourceUserId) {
+          this.sendToUserCallback(uid, removeMessage);
+        }
+      }
+    }
+
+    if (viewportChange.usersEntering.length > 0) {
+      const enterMessage: WSMessage = {
+        type: 'operation',
+        data: {
+          ...moveOp,
+          type: 'create',
+          element: result.element,
+        },
+        timestamp: Date.now(),
+      };
+
+      for (const uid of viewportChange.usersEntering) {
+        if (uid !== sourceUserId) {
+          this.sendToUserCallback(uid, enterMessage);
+        }
+      }
+    }
+
+    if (viewportChange.usersStaying.length > 0) {
+      const updateMessage: WSMessage = {
+        type: 'operation',
+        data: moveOp,
+        timestamp: Date.now(),
+      };
+
+      for (const uid of viewportChange.usersStaying) {
+        if (uid !== sourceUserId) {
+          this.sendToUserCallback(uid, updateMessage);
+        }
+      }
+    }
+  }
+
+  private handleUpdateBroadcast(result: OperationResult, sourceUserId: string): void {
+    if (!result.element) return;
+
+    const usersToNotify = this.viewportManager.onElementUpdated(result.element);
+
+    const message: WSMessage = {
+      type: 'operation',
+      data: result.operation,
+      timestamp: Date.now(),
+    };
+
+    for (const uid of usersToNotify) {
+      if (uid !== sourceUserId) {
+        this.sendToUserCallback(uid, message);
       }
     }
   }
