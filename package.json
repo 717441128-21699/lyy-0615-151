@@ -7,7 +7,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
-    "test": "ts-node test/quadtree.test.ts"
+    "test": "ts-node test/all.test.ts"
   },
   "dependencies": {
     "ws": "^8.14.0",

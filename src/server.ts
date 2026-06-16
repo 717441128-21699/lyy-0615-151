@@ -8,6 +8,7 @@ import {
   ViewportUpdateMessage,
   CursorUpdateMessage,
   CreateElementMessage,
+  ReconnectMessage,
   WSMessageType,
 } from './types';
 import { Room } from './room';
@@ -129,6 +130,9 @@ export class WhiteboardServer {
         break;
       case 'create_element':
         this.handleCreateElement(client, message.data as CreateElementMessage);
+        break;
+      case 'reconnect':
+        this.handleReconnect(client, message.data as ReconnectMessage);
         break;
       default:
         this.sendToClient(client.id, {
@@ -291,6 +295,58 @@ export class WhiteboardServer {
     }
 
     room.handleCreateElement(client.userId, data);
+  }
+
+  private handleReconnect(client: ClientConnection, data: ReconnectMessage): void {
+    const { roomId, userId, userName, viewport } = data;
+
+    if (!roomId || !userId || !userName) {
+      this.sendToClient(client.id, {
+        type: 'reconnect_diff',
+        data: {
+          success: false,
+          error: 'Missing required fields: roomId, userId, userName',
+          viewport,
+          added: [],
+          removed: [],
+          updated: [],
+          users: [],
+          fromTimestamp: 0,
+          toTimestamp: Date.now(),
+          isFullSync: false,
+        },
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
+    if (client.roomId && client.roomId !== roomId) {
+      this.handleLeave(client);
+    }
+
+    client.userId = userId;
+    client.roomId = roomId;
+
+    let room = this.rooms.get(roomId);
+    if (!room) {
+      room = new Room(
+        roomId,
+        `Room ${roomId}`,
+        (rid, msg, exclude) => this.broadcastToRoom(rid, msg, exclude),
+        (uid, msg) => this.sendToUserInRoom(roomId, uid, msg),
+        this.workerId
+      );
+      this.rooms.set(roomId, room);
+      console.log(`Room created by reconnect: ${roomId}`);
+    }
+
+    const diff = room.reconnectUser(data);
+
+    this.sendToClient(client.id, {
+      type: 'reconnect_diff',
+      data: diff,
+      timestamp: Date.now(),
+    });
   }
 
   private handleDisconnect(clientId: string): void {

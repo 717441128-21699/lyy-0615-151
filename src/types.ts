@@ -164,6 +164,7 @@ export interface RoomState {
 
 export type WSMessageType =
   | 'join'
+  | 'reconnect'
   | 'leave'
   | 'operation'
   | 'batch_operation'
@@ -171,6 +172,7 @@ export type WSMessageType =
   | 'cursor_update'
   | 'elements_in_viewport'
   | 'viewport_diff'
+  | 'reconnect_diff'
   | 'create_element'
   | 'create_element_response'
   | 'elements_removed'
@@ -183,13 +185,6 @@ export interface WSMessage<T = any> {
   type: WSMessageType;
   data: T;
   timestamp?: number;
-}
-
-export interface JoinMessage {
-  roomId: string;
-  userId: string;
-  userName: string;
-  viewport: Viewport;
 }
 
 export interface OperationMessage {
@@ -223,6 +218,9 @@ export interface SyncAckMessage {
   accepted: boolean;
   reason?: string;
   serverVersion?: number;
+  serverElement?: WhiteboardElement;
+  conflictType?: 'version_mismatch' | 'lock_held' | 'not_found' | 'invalid' | 'duplicate_id';
+  acceptedBy?: string;
 }
 
 export type ElementCreateInput =
@@ -264,4 +262,33 @@ export interface ElementsAddedMessage {
   elements: WhiteboardElement[];
   reason?: 'moved_in' | 'created';
   timestamp: number;
+}
+
+export interface ReconnectMessage {
+  roomId: string;
+  userId: string;
+  userName: string;
+  viewport: Viewport;
+  lastSyncTimestamp: number;
+}
+
+export interface ReconnectDiffMessage {
+  success: boolean;
+  viewport: Viewport;
+  added: WhiteboardElement[];
+  removed: string[];
+  updated: WhiteboardElement[];
+  users: UserState[];
+  fromTimestamp: number;
+  toTimestamp: number;
+  isFullSync: boolean;
+  error?: string;
+}
+
+export interface JoinMessage {
+  roomId: string;
+  userId: string;
+  userName: string;
+  viewport: Viewport;
+  lastSyncTimestamp?: number;
 }

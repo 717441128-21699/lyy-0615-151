@@ -215,42 +215,15 @@ export class ViewportManager {
   }
 
   onElementCreated(element: WhiteboardElement): string[] {
-    const usersInArea = this.getUsersInElementArea(element);
-
-    for (const userId of usersInArea) {
-      const versions = this.userElementVersions.get(userId);
-      if (versions) {
-        versions.set(element.id, element.version);
-      }
-    }
-
-    return usersInArea;
+    return this.getUsersInElementArea(element);
   }
 
   onElementDeleted(elementId: string, elementRect: Rect): string[] {
-    const usersInArea = this.getUsersInRect(elementRect);
-
-    for (const userId of usersInArea) {
-      const versions = this.userElementVersions.get(userId);
-      if (versions) {
-        versions.delete(elementId);
-      }
-    }
-
-    return usersInArea;
+    return this.getUsersInRect(elementRect);
   }
 
   onElementUpdated(element: WhiteboardElement): string[] {
-    const usersInArea = this.getUsersInElementArea(element);
-
-    for (const userId of usersInArea) {
-      const versions = this.userElementVersions.get(userId);
-      if (versions) {
-        versions.set(element.id, element.version);
-      }
-    }
-
-    return usersInArea;
+    return this.getUsersInElementArea(element);
   }
 
   getUsersInElementArea(element: WhiteboardElement): string[] {

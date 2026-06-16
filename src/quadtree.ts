@@ -9,13 +9,20 @@ export class QuadTree<T extends WhiteboardElement = WhiteboardElement> {
   private items: QuadTreeItem<T>[] = [];
   private children: QuadTree<T>[] = [];
   private isDivided = false;
+  private actualBounds: Rect;
 
   constructor(
     public bounds: Rect,
     private maxItems: number = 10,
-    private maxDepth: number = 8,
+    private maxDepth: number = 12,
     private depth: number = 0
-  ) {}
+  ) {
+    this.actualBounds = { ...bounds };
+  }
+
+  getActualBounds(): Rect {
+    return { ...this.actualBounds };
+  }
 
   private getBounds(element: T): Rect {
     return {
@@ -51,6 +58,43 @@ export class QuadTree<T extends WhiteboardElement = WhiteboardElement> {
       child.x + child.width <= parent.x + parent.width &&
       child.y + child.height <= parent.y + parent.height
     );
+  }
+
+  private expandBoundsToContain(rect: Rect): void {
+    const newX = Math.min(this.actualBounds.x, rect.x);
+    const newY = Math.min(this.actualBounds.y, rect.y);
+    const newMaxX = Math.max(
+      this.actualBounds.x + this.actualBounds.width,
+      rect.x + rect.width
+    );
+    const newMaxY = Math.max(
+      this.actualBounds.y + this.actualBounds.height,
+      rect.y + rect.height
+    );
+
+    const centerX = (newX + newMaxX) / 2;
+    const centerY = (newY + newMaxY) / 2;
+    const currentHalfW = this.actualBounds.width / 2;
+    const currentHalfH = this.actualBounds.height / 2;
+
+    let expandFactor = 1;
+    while (
+      centerX - currentHalfW * expandFactor > newX ||
+      centerX + currentHalfW * expandFactor < newMaxX ||
+      centerY - currentHalfH * expandFactor > newY ||
+      centerY + currentHalfH * expandFactor < newMaxY
+    ) {
+      expandFactor *= 2;
+    }
+
+    this.actualBounds = {
+      x: centerX - currentHalfW * expandFactor,
+      y: centerY - currentHalfH * expandFactor,
+      width: currentHalfW * expandFactor * 2,
+      height: currentHalfH * expandFactor * 2,
+    };
+
+    this.bounds = { ...this.actualBounds };
   }
 
   private divide(): void {
@@ -91,10 +135,35 @@ export class QuadTree<T extends WhiteboardElement = WhiteboardElement> {
   insert(element: T, bounds?: Rect): boolean {
     const elementBounds = bounds || this.getBounds(element);
 
+    if (!this.contains(this.bounds, elementBounds)) {
+      this.expandBoundsToContain(elementBounds);
+
+      if (this.isDivided) {
+        const allItems = this.getAll();
+        this.items = [];
+        this.children = [];
+        this.isDivided = false;
+
+        for (const item of allItems) {
+          const itemBounds = {
+            x: item.x,
+            y: item.y,
+            width: item.width,
+            height: item.height,
+          };
+          this._insertInternal(item, itemBounds);
+        }
+      }
+    }
+
     if (!this.intersects(this.bounds, elementBounds)) {
       return false;
     }
 
+    return this._insertInternal(element, elementBounds);
+  }
+
+  private _insertInternal(element: T, elementBounds: Rect): boolean {
     if (this.contains(this.bounds, elementBounds) && this.items.length < this.maxItems) {
       this.items.push({ element, bounds: elementBounds });
       return true;
@@ -154,10 +223,52 @@ export class QuadTree<T extends WhiteboardElement = WhiteboardElement> {
   }
 
   update(element: T): boolean {
+    const oldItem = this.findItem(element.id);
+    const oldBounds = oldItem?.bounds;
+    const newBounds = this.getBounds(element);
+
+    const boundsChanged =
+      !oldBounds ||
+      oldBounds.x !== newBounds.x ||
+      oldBounds.y !== newBounds.y ||
+      oldBounds.width !== newBounds.width ||
+      oldBounds.height !== newBounds.height;
+
     if (this.remove(element.id)) {
-      return this.insert(element);
+      if (boundsChanged && !this.contains(this.bounds, newBounds)) {
+        this.expandBoundsToContain(newBounds);
+        const allItems = this.getAll();
+        this.items = [];
+        this.children = [];
+        this.isDivided = false;
+        for (const item of allItems) {
+          const itemBounds = {
+            x: item.x,
+            y: item.y,
+            width: item.width,
+            height: item.height,
+          };
+          this._insertInternal(item, itemBounds);
+        }
+      }
+      return this._insertInternal(element, newBounds);
     }
     return false;
+  }
+
+  private findItem(elementId: string): QuadTreeItem<T> | undefined {
+    for (const item of this.items) {
+      if (item.element.id === elementId) {
+        return item;
+      }
+    }
+    if (this.isDivided) {
+      for (const child of this.children) {
+        const found = child.findItem(elementId);
+        if (found) return found;
+      }
+    }
+    return undefined;
   }
 
   getAll(): T[] {

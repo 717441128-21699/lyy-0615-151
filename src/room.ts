@@ -11,6 +11,8 @@ import {
   ElementsRemovedMessage,
   Rect,
   MoveOperation,
+  ReconnectMessage,
+  ReconnectDiffMessage,
 } from './types';
 import { ElementManager } from './element-manager';
 import { OperationProcessor, OperationResult } from './operation-processor';
@@ -94,6 +96,182 @@ export class Room {
     return user;
   }
 
+  reconnectUser(data: ReconnectMessage): ReconnectDiffMessage {
+    const { userId, userName, viewport, lastSyncTimestamp } = data;
+
+    const earliestTimestamp = this.operationProcessor.getEarliestHistoryTimestamp();
+    const now = Date.now();
+
+    if (lastSyncTimestamp <= 0 || lastSyncTimestamp < earliestTimestamp) {
+      const user: UserState = {
+        id: userId,
+        name: userName,
+        color: this.generateUserColor(userId),
+        viewport,
+        lastActive: now,
+      };
+      this.users.set(userId, user);
+      this.viewportManager.setUserViewport(userId, viewport);
+
+      const elementsData = this.viewportManager.getElementsForUser(userId);
+
+      return {
+        success: true,
+        viewport,
+        added: elementsData ? elementsData.elements : [],
+        removed: [],
+        updated: [],
+        users: this.getAllUsers().filter((u) => u.id !== userId),
+        fromTimestamp: 0,
+        toTimestamp: now,
+        isFullSync: true,
+      };
+    }
+
+    let user = this.users.get(userId);
+    if (!user) {
+      user = {
+        id: userId,
+        name: userName,
+        color: this.generateUserColor(userId),
+        viewport,
+        lastActive: now,
+      };
+    } else {
+      user.name = userName;
+      user.viewport = viewport;
+      user.lastActive = now;
+    }
+    this.users.set(userId, user);
+    this.viewportManager.setUserViewport(userId, viewport);
+
+    const history = this.operationProcessor.getHistorySince(lastSyncTimestamp);
+
+    const currentElements = this.viewportManager.getElementsInViewport(viewport);
+    const currentElementIds = new Set(currentElements.map((e) => e.id));
+    const currentElementsById = new Map(currentElements.map((e) => [e.id, e]));
+
+    const createdSinceIds = new Set<string>();
+    const deletedSinceIds = new Set<string>();
+    const deletedSinceRects = new Map<string, Rect>();
+    const updatedSinceElements = new Map<string, WhiteboardElement>();
+
+    for (const entry of history) {
+      const op = entry.operation;
+      switch (op.type) {
+        case 'create':
+          createdSinceIds.add(op.elementId);
+          break;
+        case 'delete':
+          deletedSinceIds.add(op.elementId);
+          if (entry.oldRect) {
+            deletedSinceRects.set(op.elementId, entry.oldRect);
+          } else if (entry.elementBefore) {
+            deletedSinceRects.set(op.elementId, {
+              x: entry.elementBefore.x,
+              y: entry.elementBefore.y,
+              width: entry.elementBefore.width,
+              height: entry.elementBefore.height,
+            });
+          }
+          break;
+        case 'move':
+        case 'resize':
+        case 'update':
+        case 'reorder':
+          if (entry.elementAfter) {
+            updatedSinceElements.set(op.elementId, entry.elementAfter);
+          }
+          if (entry.elementBefore && !deletedSinceIds.has(op.elementId) && !currentElementIds.has(op.elementId)) {
+            deletedSinceIds.add(op.elementId);
+            deletedSinceRects.set(op.elementId, {
+              x: entry.elementBefore.x,
+              y: entry.elementBefore.y,
+              width: entry.elementBefore.width,
+              height: entry.elementBefore.height,
+            });
+          }
+          break;
+      }
+    }
+
+    const previousElementIds = new Set<string>([...currentElementIds].filter((id) => !createdSinceIds.has(id)));
+    for (const [id, rect] of deletedSinceRects) {
+      const expandedViewport = {
+        x: viewport.x - viewport.width * 0.1,
+        y: viewport.y - viewport.height * 0.1,
+        width: viewport.width * 1.2,
+        height: viewport.height * 1.2,
+      };
+      const intersects =
+        rect.x < expandedViewport.x + expandedViewport.width &&
+        rect.x + rect.width > expandedViewport.x &&
+        rect.y < expandedViewport.y + expandedViewport.height &&
+        rect.y + rect.height > expandedViewport.y;
+      if (intersects) {
+        previousElementIds.add(id);
+      }
+    }
+
+    const added: WhiteboardElement[] = [];
+    const removed: string[] = [];
+    const updated: WhiteboardElement[] = [];
+    const processedIds = new Set<string>();
+
+    for (const id of createdSinceIds) {
+      if (processedIds.has(id)) continue;
+      processedIds.add(id);
+      const el = currentElementsById.get(id) || updatedSinceElements.get(id);
+      if (el && currentElementIds.has(id) && !previousElementIds.has(id)) {
+        added.push(el);
+      }
+    }
+
+    for (const id of deletedSinceIds) {
+      if (processedIds.has(id)) continue;
+      processedIds.add(id);
+      if (previousElementIds.has(id)) {
+        removed.push(id);
+      }
+    }
+
+    for (const [id, el] of updatedSinceElements) {
+      if (processedIds.has(id)) continue;
+      processedIds.add(id);
+      if (currentElementIds.has(id)) {
+        if (previousElementIds.has(id)) {
+          updated.push(el);
+        } else {
+          added.push(el);
+        }
+      } else if (previousElementIds.has(id)) {
+        removed.push(id);
+      }
+    }
+
+    for (const el of currentElements) {
+      if (processedIds.has(el.id)) continue;
+      processedIds.add(el.id);
+      if (!previousElementIds.has(el.id)) {
+        added.push(el);
+      }
+    }
+
+    this.viewportManager.getElementsForUser(userId);
+
+    return {
+      success: true,
+      viewport,
+      added,
+      removed,
+      updated,
+      users: this.getAllUsers().filter((u) => u.id !== userId),
+      fromTimestamp: lastSyncTimestamp,
+      toTimestamp: now,
+      isFullSync: false,
+    };
+  }
+
   removeUser(userId: string): boolean {
     const user = this.users.get(userId);
     if (!user) return false;
@@ -129,6 +307,8 @@ export class Room {
   handleCreateElement(userId: string, message: CreateElementMessage): void {
     try {
       const element = this.elementManager.createElement(message.element, userId);
+
+      this.operationProcessor.recordExternalCreate(element, userId);
 
       const usersToNotify = this.viewportManager.onElementCreated(element);
 
@@ -228,12 +408,7 @@ export class Room {
     for (const op of operations) {
       const result = this.operationProcessor.process(op);
       results.push(result);
-
-      if (result.success && result.element) {
-        this.sendSyncAck(userId, op.id, true, result.element.version);
-      } else if (!result.success) {
-        this.sendSyncAck(userId, op.id, false, undefined, result.error);
-      }
+      this.sendSyncAckResult(userId, result);
     }
 
     this.broadcastOperations(results, userId);
@@ -385,6 +560,18 @@ export class Room {
         this.sendToUserCallback(uid, message);
       }
     }
+  }
+
+  private sendSyncAckResult(
+    userId: string,
+    result: OperationResult
+  ): void {
+    const syncAck = this.operationProcessor.buildSyncAck(result);
+    this.sendToUserCallback(userId, {
+      type: 'sync_ack',
+      data: syncAck,
+      timestamp: Date.now(),
+    });
   }
 
   private sendSyncAck(

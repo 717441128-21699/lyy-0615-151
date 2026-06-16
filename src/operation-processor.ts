@@ -8,8 +8,11 @@ import {
   ReorderOperation,
   ResizeOperation,
   Rect,
+  SyncAckMessage,
 } from './types';
 import { ElementManager } from './element-manager';
+
+export type ConflictType = 'version_mismatch' | 'lock_held' | 'not_found' | 'invalid' | 'duplicate_id';
 
 export interface OperationResult {
   success: boolean;
@@ -21,12 +24,24 @@ export interface OperationResult {
   oldRect?: Rect;
   newRect?: Rect;
   operationType?: 'create' | 'delete' | 'move' | 'resize' | 'update' | 'reorder';
+  conflictType?: ConflictType;
+  serverVersion?: number;
+  serverElement?: WhiteboardElement;
+  acceptedBy?: string;
+}
+
+export interface OperationHistoryEntry {
+  operation: WhiteboardOperation;
+  elementAfter?: WhiteboardElement;
+  elementBefore?: WhiteboardElement;
+  oldRect?: Rect;
+  newRect?: Rect;
 }
 
 export class OperationProcessor {
   private elementManager: ElementManager;
-  private operationHistory: WhiteboardOperation[] = [];
-  private maxHistorySize: number = 10000;
+  private operationHistory: OperationHistoryEntry[] = [];
+  private maxHistorySize: number = 100000;
   private elementLocks: Map<string, string> = new Map();
   private lockTimers: Map<string, NodeJS.Timeout> = new Map();
   private lockTimeout: number = 5000;
@@ -36,6 +51,20 @@ export class OperationProcessor {
   }
 
   process(operation: WhiteboardOperation): OperationResult {
+    if (this.elementLocks.has(operation.elementId)) {
+      const lockHolder = this.elementLocks.get(operation.elementId);
+      if (lockHolder && lockHolder !== operation.userId) {
+        return {
+          success: false,
+          operation,
+          error: `Element is locked by user ${lockHolder}`,
+          conflictType: 'lock_held',
+          acceptedBy: lockHolder,
+          element: this.elementManager.getElement(operation.elementId),
+        } as OperationResult;
+      }
+    }
+
     switch (operation.type) {
       case 'create':
         return this.processCreate(operation as CreateOperation);
@@ -50,7 +79,20 @@ export class OperationProcessor {
       case 'reorder':
         return this.processReorder(operation as ReorderOperation);
       default:
-        return { success: false, operation, error: 'Unknown operation type' };
+        return {
+          success: false,
+          operation,
+          error: 'Unknown operation type',
+          conflictType: 'invalid',
+        };
+    }
+  }
+
+  private addToHistory(entry: OperationHistoryEntry): void {
+    this.operationHistory.push(entry);
+
+    if (this.operationHistory.length > this.maxHistorySize) {
+      this.operationHistory.splice(0, this.operationHistory.length - this.maxHistorySize);
     }
   }
 
@@ -61,13 +103,13 @@ export class OperationProcessor {
         operation: op,
         error: 'Element with this ID already exists',
         operationType: 'create',
+        conflictType: 'duplicate_id',
+        serverElement: this.elementManager.getElement(op.elementId),
       };
     }
 
     const element = { ...op.element, version: 1 };
     const result = this.elementManager.addElement(element);
-
-    this.addToHistory(op);
 
     const newRect: Rect = {
       x: result.x,
@@ -76,12 +118,19 @@ export class OperationProcessor {
       height: result.height,
     };
 
+    this.addToHistory({
+      operation: op,
+      elementAfter: result,
+      newRect,
+    });
+
     return {
       success: true,
       operation: op,
       element: result,
       newRect,
       operationType: 'create',
+      serverVersion: result.version,
     };
   }
 
@@ -93,16 +142,20 @@ export class OperationProcessor {
         operation: op,
         error: 'Element not found',
         operationType: 'delete',
+        conflictType: 'not_found',
       };
     }
 
-    if (op.version > 0 && op.version !== element.version) {
+    if (op.version !== element.version) {
       return {
         success: false,
         operation: op,
-        error: 'Version conflict',
+        error: `Version conflict: expected v${op.version}, server has v${element.version}`,
         needsTransform: true,
         operationType: 'delete',
+        conflictType: 'version_mismatch',
+        serverVersion: element.version,
+        serverElement: { ...element },
       };
     }
 
@@ -116,17 +169,29 @@ export class OperationProcessor {
     const success = this.elementManager.deleteElement(op.elementId);
 
     if (success) {
-      this.addToHistory(op);
+      this.addToHistory({
+        operation: op,
+        elementBefore: { ...element },
+        oldRect,
+      });
+
       return {
         success: true,
         operation: op,
         element,
         oldRect,
         operationType: 'delete',
+        serverVersion: 0,
       };
     }
 
-    return { success: false, operation: op, error: 'Delete failed', operationType: 'delete' };
+    return {
+      success: false,
+      operation: op,
+      error: 'Delete failed',
+      operationType: 'delete',
+      conflictType: 'invalid',
+    };
   }
 
   private processMove(op: MoveOperation): OperationResult {
@@ -137,6 +202,7 @@ export class OperationProcessor {
         operation: op,
         error: 'Element not found',
         operationType: 'move',
+        conflictType: 'not_found',
       };
     }
 
@@ -147,20 +213,36 @@ export class OperationProcessor {
       height: element.height,
     };
 
-    if (op.version > 0 && op.version !== element.version) {
-      return this.transformMoveOperation(op, element, oldRect);
+    if (op.version !== element.version) {
+      return {
+        success: false,
+        operation: op,
+        error: `Version conflict: expected v${op.version}, server has v${element.version}`,
+        operationType: 'move',
+        conflictType: 'version_mismatch',
+        serverVersion: element.version,
+        serverElement: { ...element },
+      };
     }
 
     const result = this.elementManager.moveElement(op.elementId, op.dx, op.dy);
 
     if (result) {
-      this.addToHistory(op);
       const newRect: Rect = {
         x: result.x,
         y: result.y,
         width: result.width,
         height: result.height,
       };
+
+      this.addToHistory({
+        operation: op,
+        elementBefore: { ...element },
+        elementAfter: result,
+        oldRect,
+        newRect,
+      });
+
       return {
         success: true,
         operation: op,
@@ -168,10 +250,18 @@ export class OperationProcessor {
         oldRect,
         newRect,
         operationType: 'move',
+        serverVersion: result.version,
+        acceptedBy: op.userId,
       };
     }
 
-    return { success: false, operation: op, error: 'Move failed', operationType: 'move' };
+    return {
+      success: false,
+      operation: op,
+      error: 'Move failed',
+      operationType: 'move',
+      conflictType: 'invalid',
+    };
   }
 
   private transformMoveOperation(
@@ -192,13 +282,21 @@ export class OperationProcessor {
     });
 
     if (result) {
-      this.addToHistory(transformedOp);
       const newRect: Rect = {
         x: result.x,
         y: result.y,
         width: result.width,
         height: result.height,
       };
+
+      this.addToHistory({
+        operation: transformedOp,
+        elementBefore: { ...currentElement },
+        elementAfter: result,
+        oldRect,
+        newRect,
+      });
+
       return {
         success: true,
         operation: transformedOp,
@@ -207,10 +305,20 @@ export class OperationProcessor {
         oldRect,
         newRect,
         operationType: 'move',
+        serverVersion: result.version,
+        conflictType: 'version_mismatch',
+        serverElement: { ...currentElement },
+        acceptedBy: op.userId,
       };
     }
 
-    return { success: false, operation: op, error: 'Transform move failed', operationType: 'move' };
+    return {
+      success: false,
+      operation: op,
+      error: 'Transform move failed',
+      operationType: 'move',
+      conflictType: 'invalid',
+    };
   }
 
   private processResize(op: ResizeOperation): OperationResult {
@@ -220,15 +328,28 @@ export class OperationProcessor {
         success: false,
         operation: op,
         error: 'Element not found',
+        operationType: 'resize',
+        conflictType: 'not_found',
       };
     }
 
-    if (op.version > 0 && op.version !== element.version) {
+    const oldRect: Rect = {
+      x: element.x,
+      y: element.y,
+      width: element.width,
+      height: element.height,
+    };
+
+    if (op.version !== element.version) {
       return {
         success: false,
         operation: op,
-        error: 'Version conflict',
+        error: `Version conflict: expected v${op.version}, server has v${element.version}`,
         needsTransform: true,
+        operationType: 'resize',
+        conflictType: 'version_mismatch',
+        serverVersion: element.version,
+        serverElement: { ...element },
       };
     }
 
@@ -239,11 +360,39 @@ export class OperationProcessor {
     );
 
     if (result) {
-      this.addToHistory(op);
-      return { success: true, operation: op, element: result };
+      const newRect: Rect = {
+        x: result.x,
+        y: result.y,
+        width: result.width,
+        height: result.height,
+      };
+
+      this.addToHistory({
+        operation: op,
+        elementBefore: { ...element },
+        elementAfter: result,
+        oldRect,
+        newRect,
+      });
+
+      return {
+        success: true,
+        operation: op,
+        element: result,
+        oldRect,
+        newRect,
+        operationType: 'resize',
+        serverVersion: result.version,
+      };
     }
 
-    return { success: false, operation: op, error: 'Resize failed' };
+    return {
+      success: false,
+      operation: op,
+      error: 'Resize failed',
+      operationType: 'resize',
+      conflictType: 'invalid',
+    };
   }
 
   private processUpdate(op: UpdateOperation): OperationResult {
@@ -253,15 +402,21 @@ export class OperationProcessor {
         success: false,
         operation: op,
         error: 'Element not found',
+        operationType: 'update',
+        conflictType: 'not_found',
       };
     }
 
-    if (op.version > 0 && op.version !== element.version) {
+    if (op.version !== element.version) {
       return {
         success: false,
         operation: op,
-        error: 'Version conflict',
+        error: `Version conflict: expected v${op.version}, server has v${element.version}`,
         needsTransform: true,
+        operationType: 'update',
+        conflictType: 'version_mismatch',
+        serverVersion: element.version,
+        serverElement: { ...element },
       };
     }
 
@@ -271,11 +426,28 @@ export class OperationProcessor {
     );
 
     if (result) {
-      this.addToHistory(op);
-      return { success: true, operation: op, element: result };
+      this.addToHistory({
+        operation: op,
+        elementBefore: { ...element },
+        elementAfter: result,
+      });
+
+      return {
+        success: true,
+        operation: op,
+        element: result,
+        operationType: 'update',
+        serverVersion: result.version,
+      };
     }
 
-    return { success: false, operation: op, error: 'Update failed' };
+    return {
+      success: false,
+      operation: op,
+      error: 'Update failed',
+      operationType: 'update',
+      conflictType: 'invalid',
+    };
   }
 
   private processReorder(op: ReorderOperation): OperationResult {
@@ -285,15 +457,21 @@ export class OperationProcessor {
         success: false,
         operation: op,
         error: 'Element not found',
+        operationType: 'reorder',
+        conflictType: 'not_found',
       };
     }
 
-    if (op.version > 0 && op.version !== element.version) {
+    if (op.version !== element.version) {
       return {
         success: false,
         operation: op,
-        error: 'Version conflict',
+        error: `Version conflict: expected v${op.version}, server has v${element.version}`,
         needsTransform: true,
+        operationType: 'reorder',
+        conflictType: 'version_mismatch',
+        serverVersion: element.version,
+        serverElement: { ...element },
       };
     }
 
@@ -303,31 +481,47 @@ export class OperationProcessor {
     );
 
     if (result) {
-      this.addToHistory(op);
-      return { success: true, operation: op, element: result };
+      this.addToHistory({
+        operation: op,
+        elementBefore: { ...element },
+        elementAfter: result,
+      });
+
+      return {
+        success: true,
+        operation: op,
+        element: result,
+        operationType: 'reorder',
+        serverVersion: result.version,
+      };
     }
 
-    return { success: false, operation: op, error: 'Reorder failed' };
+    return {
+      success: false,
+      operation: op,
+      error: 'Reorder failed',
+      operationType: 'reorder',
+      conflictType: 'invalid',
+    };
   }
 
   processBatch(operations: WhiteboardOperation[]): OperationResult[] {
     return operations.map((op) => this.process(op));
   }
 
-  private addToHistory(operation: WhiteboardOperation): void {
-    this.operationHistory.push(operation);
-
-    if (this.operationHistory.length > this.maxHistorySize) {
-      this.operationHistory.shift();
-    }
-  }
-
-  getOperationHistory(): WhiteboardOperation[] {
+  getOperationHistory(): OperationHistoryEntry[] {
     return [...this.operationHistory];
   }
 
-  getHistorySince(timestamp: number): WhiteboardOperation[] {
-    return this.operationHistory.filter((op) => op.timestamp > timestamp);
+  getHistorySince(timestamp: number): OperationHistoryEntry[] {
+    return this.operationHistory.filter((entry) => entry.operation.timestamp > timestamp);
+  }
+
+  getEarliestHistoryTimestamp(): number {
+    if (this.operationHistory.length === 0) {
+      return Number.MAX_SAFE_INTEGER;
+    }
+    return this.operationHistory[0].operation.timestamp;
   }
 
   acquireLock(elementId: string, userId: string): boolean {
@@ -383,5 +577,40 @@ export class OperationProcessor {
     this.lockTimers.forEach((timer) => clearTimeout(timer));
     this.lockTimers.clear();
     this.elementLocks.clear();
+  }
+
+  buildSyncAck(result: OperationResult): SyncAckMessage {
+    return {
+      operationId: result.operation.id,
+      accepted: result.success,
+      reason: result.error,
+      serverVersion: result.serverVersion,
+      serverElement: result.serverElement ?? result.element,
+      conflictType: result.conflictType,
+      acceptedBy: result.acceptedBy,
+    };
+  }
+
+  recordExternalCreate(element: WhiteboardElement, userId: string): void {
+    const op: WhiteboardOperation = {
+      id: `create-${element.id}`,
+      type: 'create',
+      elementId: element.id,
+      element,
+      userId,
+      timestamp: element.updatedAt || Date.now(),
+      version: element.version,
+    };
+    const rect: Rect = {
+      x: element.x,
+      y: element.y,
+      width: element.width,
+      height: element.height,
+    };
+    this.addToHistory({
+      operation: op,
+      elementAfter: element,
+      newRect: rect,
+    });
   }
 }
