@@ -156,6 +156,7 @@ export class OperationProcessor {
         conflictType: 'version_mismatch',
         serverVersion: element.version,
         serverElement: { ...element },
+        acceptedBy: element.updatedBy,
       };
     }
 
@@ -222,6 +223,7 @@ export class OperationProcessor {
         conflictType: 'version_mismatch',
         serverVersion: element.version,
         serverElement: { ...element },
+        acceptedBy: element.updatedBy,
       };
     }
 
@@ -350,6 +352,7 @@ export class OperationProcessor {
         conflictType: 'version_mismatch',
         serverVersion: element.version,
         serverElement: { ...element },
+        acceptedBy: element.updatedBy,
       };
     }
 
@@ -417,6 +420,7 @@ export class OperationProcessor {
         conflictType: 'version_mismatch',
         serverVersion: element.version,
         serverElement: { ...element },
+        acceptedBy: element.updatedBy,
       };
     }
 
@@ -472,6 +476,7 @@ export class OperationProcessor {
         conflictType: 'version_mismatch',
         serverVersion: element.version,
         serverElement: { ...element },
+        acceptedBy: element.updatedBy,
       };
     }
 
@@ -515,6 +520,10 @@ export class OperationProcessor {
 
   getHistorySince(timestamp: number): OperationHistoryEntry[] {
     return this.operationHistory.filter((entry) => entry.operation.timestamp > timestamp);
+  }
+
+  getHistorySize(): number {
+    return this.operationHistory.length;
   }
 
   getEarliestHistoryTimestamp(): number {

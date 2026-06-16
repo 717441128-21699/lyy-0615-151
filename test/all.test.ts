@@ -478,6 +478,300 @@ console.log('\n【需求4】基础回归 - 确保核心链路完整');
 }
 
 // ============================================
+// 需求5: 房间短期保活 + 快照恢复
+// ============================================
+console.log('\n【需求5】房间短期保活 + 快照恢复');
+{
+  runTest('最后一个用户离开后房间不立即销毁，启动过期倒计时', () => {
+    const room = createDummyRoom('ttl-1');
+    room.setRoomTtl(60000);
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 100, y: 100, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'ttl-1', element: input, requestId: 'r1' });
+
+    const elementCountBefore = room.getStatus().elementCount;
+    assert.strictEqual(elementCountBefore, 1, '离开前应该有1个元素');
+
+    room.removeUser('u1');
+    assert.strictEqual(room.getUserCount(), 0, '移除后用户数应为0');
+    assert.strictEqual(room.getStatus().elementCount, 1, '用户离开后元素应该还在（保活）');
+    assert.strictEqual(room.getIsExpired(), false, '房间尚未过期');
+  });
+
+  await runAsyncTest('短时间内重进同一房间，能看到之前的元素（快照恢复）', async () => {
+    const room = createDummyRoom('ttl-2');
+    room.setRoomTtl(5000);
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 200, y: 200, width: 80, height: 80, fill: '#123456' };
+    room.handleCreateElement('u1', { roomId: 'ttl-2', element: input, requestId: 'r1' });
+    const elId = room.getViewportManager().getElementsInViewport(vp)[0].id;
+
+    room.removeUser('u1');
+    assert.strictEqual(room.getUserCount(), 0, '离开后用户数为0');
+
+    await delay(50);
+
+    room.addUser('u2', 'Bob', vp);
+    const elements = room.getViewportManager().getElementsInViewport(vp);
+    assert.strictEqual(elements.length, 1, '重进后应该能看到之前的1个元素');
+    assert.strictEqual(elements[0].id, elId, '元素ID应该一致');
+    assert.strictEqual((elements[0] as any).fill, '#123456', '元素属性应该保持');
+  });
+
+  runTest('getStatus 返回正确的房间状态信息', () => {
+    const room = createDummyRoom('status-1');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    room.addUser('u2', 'Bob', vp);
+
+    const input: ElementCreateInput = { type: 'circle', x: 50, y: 50, radius: 25, width: 50, height: 50, fill: 'G' };
+    room.handleCreateElement('u1', { roomId: 'status-1', element: input, requestId: 'r1' });
+
+    const status = room.getStatus();
+    assert.strictEqual(status.roomId, 'status-1', 'roomId应正确');
+    assert.strictEqual(status.onlineUserCount, 2, '在线用户数应为2');
+    assert.strictEqual(status.elementCount, 1, '元素数应为1');
+    assert.ok(status.lastActiveAt > 0, 'lastActiveAt应为正数');
+    assert.strictEqual(typeof status.canIncrementalSync, 'boolean', 'canIncrementalSync应为布尔值');
+  });
+}
+
+// ============================================
+// 需求6: 冲突回执增强 - 谁的改动作效
+// ============================================
+console.log('\n【需求6】冲突回执增强 - 显示谁的改动作效 + 最后更新者');
+{
+  runTest('版本冲突时 acceptedBy 为最后生效的用户ID', () => {
+    const em = new ElementManager();
+    const processor = new OperationProcessor(em);
+    const input: ElementCreateInput = { type: 'rectangle', x: 100, y: 100, width: 50, height: 50, fill: 'F' };
+    const el = em.createElement(input, 'user-creator');
+    assert.strictEqual(el.updatedBy, 'user-creator', '初始 updatedBy 应该是创建者');
+
+    const staleMove: MoveOperation = {
+      id: 'op-stale', type: 'move', elementId: el.id,
+      dx: 50, dy: 50, newX: 150, newY: 150,
+      version: 0, userId: 'user-late', timestamp: Date.now(),
+    };
+    const result = processor.process(staleMove);
+    const ack = processor.buildSyncAck(result);
+
+    assert.strictEqual(ack.accepted, false, '应该被拒绝');
+    assert.strictEqual(ack.conflictType, 'version_mismatch', '冲突类型正确');
+    assert.strictEqual(ack.acceptedBy, 'user-creator', 'acceptedBy应该是最后生效的用户（创建者）');
+    assert.ok(ack.serverElement, '应有serverElement');
+    assert.strictEqual(ack.serverElement!.updatedBy, 'user-creator', 'serverElement.updatedBy 应该是创建者');
+  });
+
+  await runAsyncTest('先到先得：先提交者 accepted=true，后提交者 acceptedBy=先提交者', async () => {
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    const input: ElementCreateInput = { type: 'rectangle', x: 0, y: 0, width: 100, height: 100, fill: 'F' };
+    const acks: any[] = [];
+    const raceRoom = new Room(
+      'race2', 'Room',
+      () => {},
+      (uid, msg) => { if (msg.type === 'sync_ack') acks.push({ uid, ...(msg.data as object) }); },
+      0
+    );
+    raceRoom.addUser('u-alice', 'Alice', vp);
+    raceRoom.addUser('u-bob', 'Bob', vp);
+    raceRoom.handleCreateElement('u-alice', { roomId: 'race2', element: input, requestId: 'r1' });
+
+    const vpm = raceRoom.getViewportManager();
+    const raceEl = vpm.getElementsInViewport(vp)[0];
+
+    const opAlice: MoveOperation = {
+      id: 'op-alice', type: 'move', elementId: raceEl.id,
+      dx: 100, dy: 0, newX: 100, newY: 0,
+      version: raceEl.version, userId: 'u-alice', timestamp: Date.now(),
+    };
+    const opBob: MoveOperation = {
+      id: 'op-bob', type: 'move', elementId: raceEl.id,
+      dx: 0, dy: 100, newX: 0, newY: 100,
+      version: raceEl.version, userId: 'u-bob', timestamp: Date.now(),
+    };
+
+    raceRoom.handleOperation('u-alice', opAlice);
+    raceRoom.handleOperation('u-bob', opBob);
+
+    await delay(250);
+
+    const ackAlice = acks.find(a => a.operationId === 'op-alice');
+    const ackBob = acks.find(a => a.operationId === 'op-bob');
+
+    assert.ok(ackAlice, 'alice应收到ack');
+    assert.ok(ackBob, 'bob应收到ack');
+    assert.strictEqual(ackAlice.accepted, true, 'alice的操作应被接受');
+    assert.strictEqual(ackBob.accepted, false, 'bob的操作应被拒绝');
+    assert.strictEqual(ackBob.acceptedBy, 'u-alice', 'bob的ack中acceptedBy应该是alice（先到先得）');
+    assert.strictEqual(ackBob.serverElement.updatedBy, 'u-alice', 'serverElement.updatedBy 应该是alice');
+    assert.ok(typeof ackBob.serverVersion === 'number', '应有serverVersion供客户端修正');
+  });
+}
+
+// ============================================
+// 需求7: 断线重连 - 可回放操作序列
+// ============================================
+console.log('\n【需求7】断线重连 - 可回放操作序列（按时间顺序）');
+{
+  await runAsyncTest('增量模式下 operations 按时间戳升序排列', async () => {
+    const room = createDummyRoom('replay-1');
+    const vp: Viewport = { x: 0, y: 0, width: 2000, height: 2000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+
+    const input: ElementCreateInput = { type: 'rectangle', x: 100, y: 100, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'replay-1', element: input, requestId: 'r1' });
+
+    await delay(50);
+    const t1 = Date.now();
+    await delay(20);
+
+    const processor = room.getOperationProcessor();
+    const em = room.getElementManager();
+    let el = em.getElementsByViewport(vp)[0];
+
+    for (let i = 0; i < 5; i++) {
+      await delay(15);
+      const moveOp: MoveOperation = {
+        id: `op-mv-${i}`, type: 'move', elementId: el.id,
+        dx: 10, dy: 10, newX: el.x + 10, newY: el.y + 10,
+        version: el.version, userId: 'u1', timestamp: Date.now(),
+      };
+      processor.process(moveOp);
+      const updated = em.getElement(el.id);
+      if (updated) el = updated;
+    }
+
+    const msg: ReconnectMessage = {
+      userId: 'u1', userName: 'Alice', roomId: 'replay-1',
+      viewport: vp, lastSyncTimestamp: t1,
+    };
+    const diff = room.reconnectUser(msg);
+
+    assert.strictEqual(diff.isFullSync, false, '应为增量同步');
+    assert.ok(Array.isArray(diff.operations), '应有operations数组');
+    assert.ok(diff.operations.length >= 5, `至少应有5个move操作，实际${diff.operations.length}个`);
+
+    for (let i = 1; i < diff.operations.length; i++) {
+      assert.ok(
+        diff.operations[i].timestamp >= diff.operations[i - 1].timestamp,
+        `operations应按时间升序: ${diff.operations[i - 1].timestamp} <= ${diff.operations[i].timestamp}`
+      );
+    }
+  });
+
+  await runAsyncTest('全量模式下也有 operations 可回放列表', async () => {
+    const room = createDummyRoom('replay-2');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+
+    const input1: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'replay-2', element: input1, requestId: 'r1' });
+    const input2: ElementCreateInput = { type: 'circle', x: 200, y: 200, radius: 25, width: 50, height: 50, fill: 'G' };
+    room.handleCreateElement('u1', { roomId: 'replay-2', element: input2, requestId: 'r2' });
+
+    const msg: ReconnectMessage = {
+      userId: 'u2', userName: 'Bob', roomId: 'replay-2',
+      viewport: vp, lastSyncTimestamp: 0,
+    };
+    const diff = room.reconnectUser(msg);
+
+    assert.strictEqual(diff.isFullSync, true, '应为全量同步');
+    assert.ok(Array.isArray(diff.operations), '全量模式也应有operations数组');
+    assert.ok(diff.operations.length >= 2, '至少有2个create操作');
+    assert.ok(diff.added.length >= 2, 'added里至少有2个元素');
+  });
+
+  await runAsyncTest('操作类型丰富：create → move → update → delete 连续变化可回放', async () => {
+    const room = createDummyRoom('replay-3');
+    const vp: Viewport = { x: 0, y: 0, width: 2000, height: 2000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+
+    const input: ElementCreateInput = { type: 'rectangle', x: 50, y: 50, width: 80, height: 80, fill: '#FF0000' };
+    room.handleCreateElement('u1', { roomId: 'replay-3', element: input, requestId: 'r1' });
+
+    await delay(10);
+    const em = room.getElementManager();
+    const el = em.getElementsByViewport(vp)[0];
+
+    await delay(10);
+    const moveOp: MoveOperation = {
+      id: 'op-mv', type: 'move', elementId: el.id,
+      dx: 100, dy: 100, newX: 150, newY: 150,
+      version: el.version, userId: 'u1', timestamp: Date.now(),
+    };
+    room.handleOperation('u1', moveOp);
+
+    await delay(250);
+    const t1 = Date.now();
+
+    const msg: ReconnectMessage = {
+      userId: 'u2', userName: 'Bob', roomId: 'replay-3',
+      viewport: vp, lastSyncTimestamp: 0,
+    };
+    const diff = room.reconnectUser(msg);
+
+    const opTypes = diff.operations.map((o: any) => o.type);
+    assert.ok(opTypes.includes('create'), '应有create操作');
+    assert.ok(opTypes.includes('move'), '应有move操作');
+
+    const createOps = diff.operations.filter((o: any) => o.type === 'create');
+    const moveOps = diff.operations.filter((o: any) => o.type === 'move');
+    assert.ok(createOps.length > 0, '有create');
+    assert.ok(moveOps.length > 0, '有move');
+    assert.ok(
+      createOps[createOps.length - 1].timestamp <= moveOps[0].timestamp,
+      'create 在 move 之前'
+    );
+  });
+}
+
+// ============================================
+// 需求8: 房间状态查询接口
+// ============================================
+console.log('\n【需求8】房间状态查询接口');
+{
+  runTest('房间存在时 status 包含完整字段', () => {
+    const room = createDummyRoom('stat-1');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+
+    const status = room.getStatus();
+    assert.strictEqual(status.roomId, 'stat-1', 'roomId正确');
+    assert.strictEqual(status.onlineUserCount, 1, 'onlineUserCount正确');
+    assert.strictEqual(typeof status.elementCount, 'number', 'elementCount是数字');
+    assert.strictEqual(typeof status.lastActiveAt, 'number', 'lastActiveAt是数字');
+    assert.strictEqual(typeof status.earliestHistoryTimestamp, 'number', 'earliestHistoryTimestamp是数字');
+    assert.strictEqual(typeof status.canIncrementalSync, 'boolean', 'canIncrementalSync是布尔值');
+  });
+
+  runTest('空房间（没人在线） canIncrementalSync 取决于历史', () => {
+    const room = createDummyRoom('stat-2');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'stat-2', element: input, requestId: 'r1' });
+    room.removeUser('u1');
+
+    const status = room.getStatus();
+    assert.strictEqual(status.onlineUserCount, 0, '在线用户数为0');
+    assert.strictEqual(status.elementCount, 1, '元素数仍为1（保活）');
+    assert.strictEqual(status.canIncrementalSync, true, '有操作历史所以能增量同步');
+  });
+
+  runTest('getOperationProcessor / getElementManager / getViewportManager 都能访问', () => {
+    const room = createDummyRoom('stat-3');
+    assert.ok(room.getOperationProcessor(), 'operationProcessor 可访问');
+    assert.ok(room.getElementManager(), 'elementManager 可访问');
+    assert.ok(room.getViewportManager(), 'viewportManager 可访问');
+  });
+}
+
+// ============================================
 // 汇总
 // ============================================
 console.log('\n=====================================================');

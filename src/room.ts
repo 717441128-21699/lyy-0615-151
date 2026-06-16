@@ -13,6 +13,7 @@ import {
   MoveOperation,
   ReconnectMessage,
   ReconnectDiffMessage,
+  RoomStatusMessage,
 } from './types';
 import { ElementManager } from './element-manager';
 import { OperationProcessor, OperationResult } from './operation-processor';
@@ -46,6 +47,14 @@ export class Room {
   private viewportUpdateTimers: Map<string, NodeJS.Timeout> = new Map();
   private readonly viewportUpdateDebounce: number = 100;
 
+  private roomTtl: number = 5 * 60 * 1000;
+  private expirationTimer: NodeJS.Timeout | null = null;
+  private isExpired: boolean = false;
+  private lastActiveAt: number = Date.now();
+  private isNewlyCreated: boolean = true;
+
+  private onExpireCallback?: () => void;
+
   constructor(
     id: string,
     name: string,
@@ -66,7 +75,71 @@ export class Room {
     });
   }
 
+  setRoomTtl(ttlMs: number): void {
+    this.roomTtl = ttlMs;
+  }
+
+  setOnExpire(callback: () => void): void {
+    this.onExpireCallback = callback;
+  }
+
+  getStatus(): RoomStatusMessage {
+    return {
+      roomId: this.id,
+      onlineUserCount: this.users.size,
+      elementCount: this.elementManager.getElementsCount(),
+      lastActiveAt: this.lastActiveAt,
+      earliestHistoryTimestamp: this.operationProcessor.getEarliestHistoryTimestamp(),
+      canIncrementalSync: !this.isExpired && this.operationProcessor.getHistorySize() > 0,
+      expiresAt: this.expirationTimer ? Date.now() + this.roomTtl : undefined,
+    };
+  }
+
+  getIsExpired(): boolean {
+    return this.isExpired;
+  }
+
+  markActive(): void {
+    this.lastActiveAt = Date.now();
+    this.isExpired = false;
+    if (this.expirationTimer) {
+      clearTimeout(this.expirationTimer);
+      this.expirationTimer = null;
+    }
+  }
+
+  startExpirationCountdown(): void {
+    if (this.expirationTimer) {
+      clearTimeout(this.expirationTimer);
+    }
+    if (this.users.size > 0) return;
+
+    this.expirationTimer = setTimeout(() => {
+      this.isExpired = true;
+      this.destroy();
+      if (this.onExpireCallback) {
+        this.onExpireCallback();
+      }
+    }, this.roomTtl);
+  }
+
+  cancelExpirationCountdown(): void {
+    if (this.expirationTimer) {
+      clearTimeout(this.expirationTimer);
+      this.expirationTimer = null;
+    }
+  }
+
+  consumeNewlyCreatedFlag(): boolean {
+    const flag = this.isNewlyCreated;
+    this.isNewlyCreated = false;
+    return flag;
+  }
+
   addUser(userId: string, userName: string, viewport: Viewport): UserState {
+    this.markActive();
+    this.cancelExpirationCountdown();
+
     const user: UserState = {
       id: userId,
       name: userName,
@@ -102,7 +175,7 @@ export class Room {
     const earliestTimestamp = this.operationProcessor.getEarliestHistoryTimestamp();
     const now = Date.now();
 
-    if (lastSyncTimestamp <= 0 || lastSyncTimestamp < earliestTimestamp) {
+    if (lastSyncTimestamp <= 0 || lastSyncTimestamp < earliestTimestamp || this.isExpired) {
       const user: UserState = {
         id: userId,
         name: userName,
@@ -115,12 +188,18 @@ export class Room {
 
       const elementsData = this.viewportManager.getElementsForUser(userId);
 
+      const allHistory = this.operationProcessor.getOperationHistory();
+      const operations = allHistory.map((e) => e.operation).sort(
+        (a, b) => a.timestamp - b.timestamp
+      );
+
       return {
         success: true,
         viewport,
         added: elementsData ? elementsData.elements : [],
         removed: [],
         updated: [],
+        operations,
         users: this.getAllUsers().filter((u) => u.id !== userId),
         fromTimestamp: 0,
         toTimestamp: now,
@@ -259,12 +338,17 @@ export class Room {
 
     this.viewportManager.getElementsForUser(userId);
 
+    const orderedOperations = history
+      .map((e) => e.operation)
+      .sort((a, b) => a.timestamp - b.timestamp);
+
     return {
       success: true,
       viewport,
       added,
       removed,
       updated,
+      operations: orderedOperations,
       users: this.getAllUsers().filter((u) => u.id !== userId),
       fromTimestamp: lastSyncTimestamp,
       toTimestamp: now,
@@ -288,6 +372,10 @@ export class Room {
     }
 
     this.broadcastUserLeft(userId);
+
+    if (this.users.size === 0) {
+      this.startExpirationCountdown();
+    }
 
     return true;
   }

@@ -9,6 +9,7 @@ import {
   CursorUpdateMessage,
   CreateElementMessage,
   ReconnectMessage,
+  RoomStatusQueryMessage,
   WSMessageType,
 } from './types';
 import { Room } from './room';
@@ -134,6 +135,9 @@ export class WhiteboardServer {
       case 'reconnect':
         this.handleReconnect(client, message.data as ReconnectMessage);
         break;
+      case 'room_status':
+        this.handleRoomStatusQuery(client, message.data as RoomStatusQueryMessage);
+        break;
       default:
         this.sendToClient(client.id, {
           type: 'error',
@@ -163,6 +167,7 @@ export class WhiteboardServer {
     client.roomId = roomId;
 
     let room = this.rooms.get(roomId);
+    let isNewRoom = false;
     if (!room) {
       room = new Room(
         roomId,
@@ -175,20 +180,33 @@ export class WhiteboardServer {
         },
         this.workerId
       );
+      room.setOnExpire(() => {
+        this.rooms.delete(roomId);
+        console.log(`Room expired and removed: ${roomId}`);
+      });
       this.rooms.set(roomId, room);
+      isNewRoom = true;
       console.log(`Room created: ${roomId}`);
     }
 
-    room.addUser(userId, userName, viewport);
-
+    const wasExpired = room.getIsExpired();
+    const user = room.addUser(userId, userName, viewport);
     const users = room.getAllUsers().filter((u) => u.id !== userId);
+    const status = room.getStatus();
+
+    const isSnapshotRestored = !isNewRoom && !wasExpired;
 
     this.sendToClient(client.id, {
       type: 'join',
       data: {
         success: true,
         roomId,
+        user,
         users,
+        isNewRoom,
+        isSnapshotRestored,
+        canIncrementalSync: status.canIncrementalSync,
+        lastSyncTimestamp: status.lastActiveAt,
         elementsCount: room.getElementsCount(),
       },
       timestamp: Date.now(),
@@ -203,12 +221,6 @@ export class WhiteboardServer {
     const room = this.rooms.get(client.roomId);
     if (room) {
       room.removeUser(client.userId);
-
-      if (room.getUserCount() === 0) {
-        room.destroy();
-        this.rooms.delete(client.roomId);
-        console.log(`Room destroyed: ${client.roomId}`);
-      }
     }
 
     client.roomId = null;
@@ -349,6 +361,44 @@ export class WhiteboardServer {
     });
   }
 
+  private handleRoomStatusQuery(client: ClientConnection, data: RoomStatusQueryMessage): void {
+    const { roomId } = data;
+
+    if (!roomId) {
+      this.sendToClient(client.id, {
+        type: 'error',
+        data: { message: 'Missing roomId' },
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      this.sendToClient(client.id, {
+        type: 'room_status',
+        data: {
+          roomId,
+          onlineUserCount: 0,
+          elementCount: 0,
+          lastActiveAt: 0,
+          earliestHistoryTimestamp: 0,
+          canIncrementalSync: false,
+          roomExists: false,
+        },
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
+    const status = room.getStatus();
+    this.sendToClient(client.id, {
+      type: 'room_status',
+      data: status,
+      timestamp: Date.now(),
+    });
+  }
+
   private handleDisconnect(clientId: string): void {
     const client = this.clients.get(clientId);
     if (!client) return;
@@ -359,12 +409,6 @@ export class WhiteboardServer {
       const room = this.rooms.get(client.roomId);
       if (room) {
         room.removeUser(client.userId);
-
-        if (room.getUserCount() === 0) {
-          room.destroy();
-          this.rooms.delete(client.roomId);
-          console.log(`Room destroyed: ${client.roomId}`);
-        }
       }
     }
 

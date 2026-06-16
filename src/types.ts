@@ -164,7 +164,9 @@ export interface RoomState {
 
 export type WSMessageType =
   | 'join'
+  | 'join_response'
   | 'reconnect'
+  | 'reconnect_diff'
   | 'leave'
   | 'operation'
   | 'batch_operation'
@@ -172,13 +174,13 @@ export type WSMessageType =
   | 'cursor_update'
   | 'elements_in_viewport'
   | 'viewport_diff'
-  | 'reconnect_diff'
   | 'create_element'
   | 'create_element_response'
   | 'elements_removed'
   | 'user_joined'
   | 'user_left'
   | 'sync_ack'
+  | 'room_status'
   | 'error';
 
 export interface WSMessage<T = any> {
@@ -278,11 +280,40 @@ export interface ReconnectDiffMessage {
   added: WhiteboardElement[];
   removed: string[];
   updated: WhiteboardElement[];
+  operations: WhiteboardOperation[];
   users: UserState[];
   fromTimestamp: number;
   toTimestamp: number;
   isFullSync: boolean;
   error?: string;
+}
+
+export interface JoinResponse {
+  success: boolean;
+  roomId: string;
+  user: UserState;
+  users: UserState[];
+  elements: WhiteboardElement[];
+  viewport: Viewport;
+  isNewRoom: boolean;
+  isSnapshotRestored: boolean;
+  canIncrementalSync: boolean;
+  lastSyncTimestamp: number;
+  error?: string;
+}
+
+export interface RoomStatusMessage {
+  roomId: string;
+  onlineUserCount: number;
+  elementCount: number;
+  lastActiveAt: number;
+  earliestHistoryTimestamp: number;
+  canIncrementalSync: boolean;
+  expiresAt?: number;
+}
+
+export interface RoomStatusQueryMessage {
+  roomId: string;
 }
 
 export interface JoinMessage {
