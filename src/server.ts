@@ -192,9 +192,8 @@ export class WhiteboardServer {
     const wasExpired = room.getIsExpired();
     const user = room.addUser(userId, userName, viewport);
     const users = room.getAllUsers().filter((u) => u.id !== userId);
-    const status = room.getStatus();
-
-    const isSnapshotRestored = !isNewRoom && !wasExpired;
+    const status = room.getStatus(0);
+    const activities = room.getUserActivities();
 
     this.sendToClient(client.id, {
       type: 'join',
@@ -204,10 +203,17 @@ export class WhiteboardServer {
         user,
         users,
         isNewRoom,
-        isSnapshotRestored,
+        isSnapshotRestored: !isNewRoom && !wasExpired,
         canIncrementalSync: status.canIncrementalSync,
         lastSyncTimestamp: status.lastActiveAt,
         elementsCount: room.getElementsCount(),
+        recoveryStrategy: status.recoveryStrategy,
+        recoveryReason: status.recoveryReason,
+        historyEarliestTimestamp: status.earliestHistoryTimestamp,
+        historyLatestTimestamp: status.latestHistoryTimestamp,
+        historySize: status.historySize,
+        userActivities: activities,
+        isExpired: status.isExpired,
       },
       timestamp: Date.now(),
     });
@@ -348,6 +354,10 @@ export class WhiteboardServer {
         (uid, msg) => this.sendToUserInRoom(roomId, uid, msg),
         this.workerId
       );
+      room.setOnExpire(() => {
+        this.rooms.delete(roomId);
+        console.log(`Room expired and removed: ${roomId}`);
+      });
       this.rooms.set(roomId, room);
       console.log(`Room created by reconnect: ${roomId}`);
     }
@@ -362,7 +372,7 @@ export class WhiteboardServer {
   }
 
   private handleRoomStatusQuery(client: ClientConnection, data: RoomStatusQueryMessage): void {
-    const { roomId } = data;
+    const { roomId, lastSyncTimestamp } = data;
 
     if (!roomId) {
       this.sendToClient(client.id, {
@@ -383,15 +393,20 @@ export class WhiteboardServer {
           elementCount: 0,
           lastActiveAt: 0,
           earliestHistoryTimestamp: 0,
+          latestHistoryTimestamp: 0,
+          historySize: 0,
           canIncrementalSync: false,
+          recoveryStrategy: 'full',
+          recoveryReason: 'room_not_found',
           roomExists: false,
+          isExpired: false,
         },
         timestamp: Date.now(),
       });
       return;
     }
 
-    const status = room.getStatus();
+    const status = room.getStatus(lastSyncTimestamp);
     this.sendToClient(client.id, {
       type: 'room_status',
       data: status,

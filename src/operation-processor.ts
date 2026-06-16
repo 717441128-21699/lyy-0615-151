@@ -533,6 +533,69 @@ export class OperationProcessor {
     return this.operationHistory[0].operation.timestamp;
   }
 
+  getLatestHistoryTimestamp(): number {
+    if (this.operationHistory.length === 0) {
+      return 0;
+    }
+    return this.operationHistory[this.operationHistory.length - 1].operation.timestamp;
+  }
+
+  compressHistory(options?: { keyframeIntervalMs?: number; keepMinOperations?: number }): {
+    beforeSize: number;
+    afterSize: number;
+    removedCount: number;
+  } {
+    const keyframeIntervalMs = options?.keyframeIntervalMs ?? 30_000;
+    const keepMinOperations = options?.keepMinOperations ?? 200;
+
+    const beforeSize = this.operationHistory.length;
+    if (beforeSize <= keepMinOperations) {
+      return { beforeSize, afterSize: beforeSize, removedCount: 0 };
+    }
+
+    const lastKeyframeTime = new Map<string, number>();
+    const newHistory: OperationHistoryEntry[] = [];
+
+    for (const entry of this.operationHistory) {
+      const op = entry.operation;
+      const elId = op.elementId;
+
+      if (op.type === 'create' || op.type === 'delete') {
+        lastKeyframeTime.set(elId, op.timestamp);
+        newHistory.push(entry);
+        continue;
+      }
+
+      const lastKf = lastKeyframeTime.get(elId) ?? 0;
+      const isKeyframe = op.timestamp - lastKf >= keyframeIntervalMs;
+
+      if (isKeyframe) {
+        lastKeyframeTime.set(elId, op.timestamp);
+        newHistory.push(entry);
+      } else if (
+        newHistory.length > 0 &&
+        newHistory[newHistory.length - 1].operation.elementId === elId &&
+        newHistory[newHistory.length - 1].operation.type !== 'create' &&
+        newHistory[newHistory.length - 1].operation.type !== 'delete'
+      ) {
+        newHistory[newHistory.length - 1] = entry;
+      } else {
+        newHistory.push(entry);
+      }
+    }
+
+    const removedCount = beforeSize - newHistory.length;
+    if (removedCount > 0) {
+      this.operationHistory = newHistory;
+    }
+
+    return {
+      beforeSize,
+      afterSize: newHistory.length,
+      removedCount,
+    };
+  }
+
   acquireLock(elementId: string, userId: string): boolean {
     const currentLock = this.elementLocks.get(elementId);
 

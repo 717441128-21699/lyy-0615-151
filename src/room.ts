@@ -14,6 +14,9 @@ import {
   ReconnectMessage,
   ReconnectDiffMessage,
   RoomStatusMessage,
+  UserActivity,
+  RecoveryStrategy,
+  RecoveryReason,
 } from './types';
 import { ElementManager } from './element-manager';
 import { OperationProcessor, OperationResult } from './operation-processor';
@@ -55,6 +58,8 @@ export class Room {
 
   private onExpireCallback?: () => void;
 
+  private userActivities: Map<string, UserActivity> = new Map();
+
   constructor(
     id: string,
     name: string,
@@ -83,15 +88,53 @@ export class Room {
     this.onExpireCallback = callback;
   }
 
-  getStatus(): RoomStatusMessage {
+  getStatus(lastSyncTimestamp?: number): RoomStatusMessage {
+    const historySize = this.operationProcessor.getHistorySize();
+    const earliestTs = this.operationProcessor.getEarliestHistoryTimestamp();
+    const latestTs = this.operationProcessor.getLatestHistoryTimestamp();
+
+    let recoveryStrategy: RecoveryStrategy = 'full';
+    let recoveryReason: RecoveryReason = 'no_history';
+
+    if (this.isNewlyCreated && historySize === 0) {
+      recoveryStrategy = 'full';
+      recoveryReason = 'new_room';
+    } else if (this.isExpired) {
+      recoveryStrategy = 'full';
+      recoveryReason = 'room_expired';
+    } else if (historySize === 0) {
+      recoveryStrategy = 'full';
+      recoveryReason = 'no_history';
+    } else if (lastSyncTimestamp === 0) {
+      recoveryStrategy = 'full';
+      recoveryReason = 'last_sync_zero';
+    } else if (lastSyncTimestamp !== undefined && lastSyncTimestamp > 0) {
+      if (lastSyncTimestamp < earliestTs) {
+        recoveryStrategy = 'full';
+        recoveryReason = 'history_out_of_range';
+      } else {
+        recoveryStrategy = 'incremental';
+        recoveryReason = 'history_available';
+      }
+    } else {
+      recoveryStrategy = 'snapshot';
+      recoveryReason = 'snapshot_available';
+    }
+
     return {
       roomId: this.id,
       onlineUserCount: this.users.size,
       elementCount: this.elementManager.getElementsCount(),
       lastActiveAt: this.lastActiveAt,
-      earliestHistoryTimestamp: this.operationProcessor.getEarliestHistoryTimestamp(),
-      canIncrementalSync: !this.isExpired && this.operationProcessor.getHistorySize() > 0,
+      earliestHistoryTimestamp: earliestTs,
+      latestHistoryTimestamp: latestTs,
+      historySize,
+      canIncrementalSync: !this.isExpired && historySize > 0,
+      recoveryStrategy,
+      recoveryReason,
       expiresAt: this.expirationTimer ? Date.now() + this.roomTtl : undefined,
+      isExpired: this.isExpired,
+      roomExists: true,
     };
   }
 
@@ -139,6 +182,7 @@ export class Room {
   addUser(userId: string, userName: string, viewport: Viewport): UserState {
     this.markActive();
     this.cancelExpirationCountdown();
+    this.consumeNewlyCreatedFlag();
 
     const user: UserState = {
       id: userId,
@@ -166,16 +210,25 @@ export class Room {
 
     this.broadcastUserJoined(user);
 
+    this.updateUserActivity(userId, 'join');
+
     return user;
   }
 
   reconnectUser(data: ReconnectMessage): ReconnectDiffMessage {
     const { userId, userName, viewport, lastSyncTimestamp } = data;
 
+    const wasExpired = this.isExpired;
+    const isNewRoom = this.consumeNewlyCreatedFlag();
+
+    this.markActive();
+    this.cancelExpirationCountdown();
+
     const earliestTimestamp = this.operationProcessor.getEarliestHistoryTimestamp();
+    const latestTimestamp = this.operationProcessor.getLatestHistoryTimestamp();
     const now = Date.now();
 
-    if (lastSyncTimestamp <= 0 || lastSyncTimestamp < earliestTimestamp || this.isExpired) {
+    if (lastSyncTimestamp <= 0 || lastSyncTimestamp < earliestTimestamp || wasExpired) {
       const user: UserState = {
         id: userId,
         name: userName,
@@ -193,6 +246,14 @@ export class Room {
         (a, b) => a.timestamp - b.timestamp
       );
 
+      let reason: RecoveryReason = 'last_sync_zero';
+      if (wasExpired) reason = 'room_expired';
+      else if (isNewRoom) reason = 'new_room';
+      else if (lastSyncTimestamp > 0 && lastSyncTimestamp < earliestTimestamp) reason = 'history_out_of_range';
+      else if (this.operationProcessor.getHistorySize() === 0) reason = 'no_history';
+
+      this.updateUserActivity(userId, 'reconnect_full');
+
       return {
         success: true,
         viewport,
@@ -204,6 +265,10 @@ export class Room {
         fromTimestamp: 0,
         toTimestamp: now,
         isFullSync: true,
+        recoveryStrategy: 'full',
+        recoveryReason: reason,
+        historyEarliestTimestamp: earliestTimestamp,
+        historyLatestTimestamp: latestTimestamp,
       };
     }
 
@@ -342,6 +407,8 @@ export class Room {
       .map((e) => e.operation)
       .sort((a, b) => a.timestamp - b.timestamp);
 
+    this.updateUserActivity(userId, 'reconnect_incremental');
+
     return {
       success: true,
       viewport,
@@ -353,6 +420,10 @@ export class Room {
       fromTimestamp: lastSyncTimestamp,
       toTimestamp: now,
       isFullSync: false,
+      recoveryStrategy: 'incremental',
+      recoveryReason: 'history_available',
+      historyEarliestTimestamp: earliestTimestamp,
+      historyLatestTimestamp: latestTimestamp,
     };
   }
 
@@ -372,6 +443,7 @@ export class Room {
     }
 
     this.broadcastUserLeft(userId);
+    this.userActivities.delete(userId);
 
     if (this.users.size === 0) {
       this.startExpirationCountdown();
@@ -382,6 +454,33 @@ export class Room {
 
   getUser(userId: string): UserState | undefined {
     return this.users.get(userId);
+  }
+
+  getUserActivities(): UserActivity[] {
+    return [...this.userActivities.values()];
+  }
+
+  getUserActivity(userId: string): UserActivity | undefined {
+    return this.userActivities.get(userId);
+  }
+
+  private updateUserActivity(
+    userId: string,
+    operationType?: string,
+    elementId?: string
+  ): void {
+    const user = this.users.get(userId);
+    if (!user) return;
+
+    this.userActivities.set(userId, {
+      userId,
+      userName: user.name,
+      lastActiveAt: Date.now(),
+      lastOperationType: operationType,
+      lastElementId: elementId,
+    });
+
+    this.markActive();
   }
 
   getAllUsers(): UserState[] {
@@ -397,6 +496,7 @@ export class Room {
       const element = this.elementManager.createElement(message.element, userId);
 
       this.operationProcessor.recordExternalCreate(element, userId);
+      this.updateUserActivity(userId, 'create', element.id);
 
       const usersToNotify = this.viewportManager.onElementCreated(element);
 
@@ -497,6 +597,10 @@ export class Room {
       const result = this.operationProcessor.process(op);
       results.push(result);
       this.sendSyncAckResult(userId, result);
+
+      if (result.success) {
+        this.updateUserActivity(userId, op.type, op.elementId);
+      }
     }
 
     this.broadcastOperations(results, userId);

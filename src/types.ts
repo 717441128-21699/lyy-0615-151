@@ -274,6 +274,16 @@ export interface ReconnectMessage {
   lastSyncTimestamp: number;
 }
 
+export type RecoveryStrategy = 'full' | 'incremental' | 'snapshot';
+export type RecoveryReason =
+  | 'new_room'
+  | 'room_expired'
+  | 'history_out_of_range'
+  | 'history_available'
+  | 'snapshot_available'
+  | 'last_sync_zero'
+  | 'no_history';
+
 export interface ReconnectDiffMessage {
   success: boolean;
   viewport: Viewport;
@@ -285,7 +295,40 @@ export interface ReconnectDiffMessage {
   fromTimestamp: number;
   toTimestamp: number;
   isFullSync: boolean;
+  recoveryStrategy: RecoveryStrategy;
+  recoveryReason: RecoveryReason;
+  historyEarliestTimestamp: number;
+  historyLatestTimestamp: number;
   error?: string;
+}
+
+export interface RoomStatusMessage {
+  roomId: string;
+  onlineUserCount: number;
+  elementCount: number;
+  lastActiveAt: number;
+  earliestHistoryTimestamp: number;
+  latestHistoryTimestamp: number;
+  historySize: number;
+  canIncrementalSync: boolean;
+  recoveryStrategy: RecoveryStrategy;
+  recoveryReason: RecoveryReason;
+  expiresAt?: number;
+  isExpired?: boolean;
+  roomExists?: boolean;
+}
+
+export interface RoomStatusQueryMessage {
+  roomId: string;
+  lastSyncTimestamp?: number;
+}
+
+export interface UserActivity {
+  userId: string;
+  userName: string;
+  lastActiveAt: number;
+  lastOperationType?: string;
+  lastElementId?: string;
 }
 
 export interface JoinResponse {
@@ -299,21 +342,12 @@ export interface JoinResponse {
   isSnapshotRestored: boolean;
   canIncrementalSync: boolean;
   lastSyncTimestamp: number;
+  recoveryStrategy: RecoveryStrategy;
+  recoveryReason: RecoveryReason;
+  historyEarliestTimestamp: number;
+  historyLatestTimestamp: number;
+  elementsCount: number;
   error?: string;
-}
-
-export interface RoomStatusMessage {
-  roomId: string;
-  onlineUserCount: number;
-  elementCount: number;
-  lastActiveAt: number;
-  earliestHistoryTimestamp: number;
-  canIncrementalSync: boolean;
-  expiresAt?: number;
-}
-
-export interface RoomStatusQueryMessage {
-  roomId: string;
 }
 
 export interface JoinMessage {

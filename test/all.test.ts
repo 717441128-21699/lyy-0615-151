@@ -772,6 +772,375 @@ console.log('\n【需求8】房间状态查询接口');
 }
 
 // ============================================
+// 需求9: 恢复协商流程 - 增量/快照/全量策略 + 原因说明
+// ============================================
+console.log('\n【需求9】恢复协商流程 - 增量/快照/全量策略 + 原因说明');
+{
+  runTest('新房间 getStatus 返回 recoveryStrategy=full + reason=new_room', () => {
+    const room = createDummyRoom('recov-1');
+    const status = room.getStatus();
+
+    assert.strictEqual(status.recoveryStrategy, 'full', '新房间应该是full策略');
+    assert.strictEqual(status.recoveryReason, 'new_room', '原因应为new_room');
+    assert.strictEqual(status.roomExists, true, 'roomExists=true');
+    assert.strictEqual(typeof status.historySize, 'number', 'historySize是数字');
+    assert.strictEqual(typeof status.latestHistoryTimestamp, 'number', 'latestHistoryTimestamp是数字');
+    assert.strictEqual(status.onlineUserCount, 0, '没人在线');
+  });
+
+  runTest('有历史记录且lastSync在范围内 → incremental + history_available', () => {
+    const room = createDummyRoom('recov-2');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'recov-2', element: input, requestId: 'r1' });
+
+    const earliestTs = room.getOperationProcessor().getEarliestHistoryTimestamp();
+    const lastSync = earliestTs - 1;
+    const statusBefore = room.getStatus(lastSync);
+    assert.strictEqual(statusBefore.recoveryStrategy, 'full', 'lastSync早于最早历史应full');
+    assert.strictEqual(statusBefore.recoveryReason, 'history_out_of_range', '原因是history_out_of_range');
+
+    const statusInRange = room.getStatus(earliestTs);
+    assert.strictEqual(statusInRange.recoveryStrategy, 'incremental', 'lastSync在范围内应incremental');
+    assert.strictEqual(statusInRange.recoveryReason, 'history_available', '原因是history_available');
+    assert.strictEqual(statusInRange.canIncrementalSync, true, 'canIncrementalSync=true');
+    assert.ok(statusInRange.historySize > 0, 'historySize > 0');
+    assert.ok(statusInRange.latestHistoryTimestamp > 0, 'latestHistoryTimestamp > 0');
+    assert.ok(statusInRange.earliestHistoryTimestamp > 0, 'earliestHistoryTimestamp > 0');
+  });
+
+  runTest('lastSync太早超出历史范围 → full + history_out_of_range', () => {
+    const room = createDummyRoom('recov-3');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'recov-3', element: input, requestId: 'r1' });
+
+    const tVeryOld = Date.now() - 999999999;
+    const status = room.getStatus(tVeryOld);
+    assert.strictEqual(status.recoveryStrategy, 'full', '超出范围应降级full');
+    assert.strictEqual(status.recoveryReason, 'history_out_of_range', '原因应为history_out_of_range');
+  });
+
+  runTest('lastSync为0 → full + last_sync_zero', () => {
+    const room = createDummyRoom('recov-4');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'recov-4', element: input, requestId: 'r1' });
+
+    const status = room.getStatus(0);
+    assert.strictEqual(status.recoveryStrategy, 'full', 'lastSync=0应full');
+    assert.strictEqual(status.recoveryReason, 'last_sync_zero', '原因应为last_sync_zero');
+  });
+
+  runTest('reconnect增量模式返回 recoveryStrategy=incremental + 历史范围', () => {
+    const room = createDummyRoom('recov-5');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'recov-5', element: input, requestId: 'r1' });
+
+    const earliestTs = room.getOperationProcessor().getEarliestHistoryTimestamp();
+    const msg: ReconnectMessage = { userId: 'u2', userName: 'Bob', roomId: 'recov-5', viewport: vp, lastSyncTimestamp: earliestTs };
+    const diff = room.reconnectUser(msg);
+
+    assert.strictEqual(diff.recoveryStrategy, 'incremental', 'reconnect增量策略');
+    assert.strictEqual(diff.recoveryReason, 'history_available', '增量原因');
+    assert.strictEqual(typeof diff.historyEarliestTimestamp, 'number', '有最早历史时间');
+    assert.strictEqual(typeof diff.historyLatestTimestamp, 'number', '有最新历史时间');
+    assert.ok(diff.historyLatestTimestamp >= diff.historyEarliestTimestamp, '最新 >= 最早');
+    assert.strictEqual(diff.isFullSync, false, 'isFullSync=false');
+  });
+
+  runTest('reconnect全量模式(lastSync=0)返回 recoveryStrategy=full + last_sync_zero', () => {
+    const room = createDummyRoom('recov-6');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'recov-6', element: input, requestId: 'r1' });
+
+    const msg: ReconnectMessage = { userId: 'u2', userName: 'Bob', roomId: 'recov-6', viewport: vp, lastSyncTimestamp: 0 };
+    const diff = room.reconnectUser(msg);
+
+    assert.strictEqual(diff.recoveryStrategy, 'full', 'reconnect全量策略');
+    assert.strictEqual(diff.recoveryReason, 'last_sync_zero', '全量原因是last_sync_zero');
+    assert.strictEqual(diff.isFullSync, true, 'isFullSync=true');
+  });
+
+  runTest('reconnect全量模式(lastSync太早)返回 recoveryStrategy=full + history_out_of_range', () => {
+    const room = createDummyRoom('recov-7');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'recov-7', element: input, requestId: 'r1' });
+
+    const msg: ReconnectMessage = { userId: 'u2', userName: 'Bob', roomId: 'recov-7', viewport: vp, lastSyncTimestamp: Date.now() - 999999 };
+    const diff = room.reconnectUser(msg);
+
+    assert.strictEqual(diff.recoveryStrategy, 'full', '太早应降级full');
+    assert.strictEqual(diff.recoveryReason, 'history_out_of_range', '原因是history_out_of_range');
+    assert.strictEqual(diff.isFullSync, true, 'isFullSync=true');
+  });
+}
+
+// ============================================
+// 需求10: 协作者状态 + 最后更新人准确
+// ============================================
+console.log('\n【需求10】协作者状态 + 最后更新人准确');
+{
+  runTest('用户join后有userActivity记录', () => {
+    const room = createDummyRoom('act-1');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+
+    const activities = room.getUserActivities();
+    assert.strictEqual(activities.length, 1, '1个活动记录');
+    assert.strictEqual(activities[0].userId, 'u1', 'userId正确');
+    assert.strictEqual(activities[0].userName, 'Alice', 'userName正确');
+    assert.strictEqual(typeof activities[0].lastActiveAt, 'number', 'lastActiveAt是数字');
+    assert.strictEqual(activities[0].lastOperationType, 'join', '操作类型是join');
+  });
+
+  runTest('创建元素后用户活动更新为 create + 元素ID', () => {
+    const room = createDummyRoom('act-2');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'act-2', element: input, requestId: 'r1' });
+
+    const activity = room.getUserActivity('u1');
+    assert.ok(activity, '有活动记录');
+    assert.strictEqual(activity!.lastOperationType, 'create', '操作类型是create');
+    assert.ok(activity!.lastElementId, '有元素ID');
+  });
+
+  runTest('创建者和修改者不同 - updatedBy应该是实际修改者', async () => {
+    const room = createDummyRoom('act-3');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('creator', 'CreatorUser', vp);
+    room.addUser('editor', 'EditorUser', vp);
+
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('creator', { roomId: 'act-3', element: input, requestId: 'r1' });
+
+    await delay(260);
+    const el = room.getElementManager().getAllElements()[0];
+    assert.ok(el, '有元素');
+    assert.strictEqual(el.createdBy, 'creator', 'createdBy是创建者');
+    assert.strictEqual(el.updatedBy, 'creator', '初始updatedBy是创建者');
+
+    const moveOp: MoveOperation = {
+      id: 'op-mv-1', type: 'move', elementId: el.id,
+      dx: 10, dy: 10, newX: 20, newY: 20,
+      version: el.version, userId: 'editor', timestamp: Date.now(),
+    };
+    room.handleOperation('editor', moveOp);
+
+    await delay(260);
+    const updated = room.getElementManager().getElement(el.id);
+    assert.ok(updated, '元素还在');
+    assert.strictEqual(updated!.createdBy, 'creator', 'createdBy保持创建者不变');
+    assert.strictEqual(updated!.updatedBy, 'editor', 'updatedBy应为实际修改者editor');
+
+    const editorActivity = room.getUserActivity('editor');
+    assert.strictEqual(editorActivity!.lastOperationType, 'move', 'editor最后操作是move');
+    assert.strictEqual(editorActivity!.lastElementId, el.id, '最后操作元素正确');
+  });
+
+  runTest('用户离开后活动记录被清理', () => {
+    const room = createDummyRoom('act-4');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    assert.strictEqual(room.getUserActivities().length, 1, 'join后有1条');
+
+    room.removeUser('u1');
+    assert.strictEqual(room.getUserActivities().length, 0, 'leave后0条');
+    assert.strictEqual(room.getUserActivity('u1'), undefined, '查不到u1活动');
+  });
+}
+
+// ============================================
+// 需求11: 房间保活边界 - reconnect取消倒计时 + 过期释放
+// ============================================
+console.log('\n【需求11】房间保活边界 - reconnect取消倒计时 + 过期释放');
+{
+  await runAsyncTest('reconnect回来能取消过期倒计时，房间不会被误清空', async () => {
+    const room = new Room(
+      'ttl-1', 'Room ttl-1',
+      () => {}, () => {}, 0
+    );
+    room.setRoomTtl(100);
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'ttl-1', element: input, requestId: 'r1' });
+    room.removeUser('u1');
+
+    await delay(50);
+    const earliestTs = room.getOperationProcessor().getEarliestHistoryTimestamp();
+    const msg: ReconnectMessage = { userId: 'u1', userName: 'Alice', roomId: 'ttl-1', viewport: vp, lastSyncTimestamp: earliestTs };
+    room.reconnectUser(msg);
+
+    await delay(80);
+    assert.strictEqual(room.getIsExpired(), false, 'reconnect后不应过期');
+    assert.strictEqual(room.getElementsCount(), 1, '元素仍然存在');
+    assert.strictEqual(room.getUserCount(), 1, '用户回来了');
+  });
+
+  await runAsyncTest('空房间过期后正常释放（isExpired=true）', async () => {
+    const room = new Room(
+      'ttl-2', 'Room ttl-2',
+      () => {}, () => {}, 0
+    );
+    room.setRoomTtl(50);
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    room.removeUser('u1');
+
+    await delay(120);
+    assert.strictEqual(room.getIsExpired(), true, '应该过期了');
+  });
+
+  await runAsyncTest('过期房间reconnect返回 room_expired 原因 + 全量初始化', async () => {
+    let expired = false;
+    const room = new Room(
+      'ttl-3', 'Room ttl-3',
+      () => {}, () => {}, 0
+    );
+    room.setRoomTtl(50);
+    room.setOnExpire(() => { expired = true; });
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'ttl-3', element: input, requestId: 'r1' });
+    room.removeUser('u1');
+
+    await delay(120);
+    assert.strictEqual(room.getIsExpired(), true, '确认已过期');
+    assert.strictEqual(expired, true, 'onExpire回调被调用');
+
+    const msg: ReconnectMessage = { userId: 'u2', userName: 'Bob', roomId: 'ttl-3', viewport: vp, lastSyncTimestamp: Date.now() };
+    const diff = room.reconnectUser(msg);
+
+    assert.strictEqual(diff.recoveryStrategy, 'full', '过期后重连应全量');
+    assert.strictEqual(diff.recoveryReason, 'room_expired', '原因是room_expired');
+    assert.strictEqual(diff.isFullSync, true, 'isFullSync=true');
+  });
+
+  await runAsyncTest('getStatus能看到expiresAt和isExpired字段', async () => {
+    const room = new Room(
+      'ttl-4', 'Room ttl-4',
+      () => {}, () => {}, 0
+    );
+    room.setRoomTtl(1000);
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    room.removeUser('u1');
+
+    const status = room.getStatus();
+    assert.strictEqual(status.isExpired, false, '刚离开不应过期');
+    assert.strictEqual(typeof status.expiresAt, 'number', '有expiresAt字段');
+    assert.ok(status.expiresAt! > Date.now(), 'expiresAt在未来');
+  });
+}
+
+// ============================================
+// 需求12: 历史压缩能力 - 关键帧 + 连续操作合并
+// ============================================
+console.log('\n【需求12】历史压缩能力 - 关键帧 + 连续操作合并');
+{
+  runTest('compressHistory 能减少历史条数并保留关键帧', () => {
+    const room = createDummyRoom('compress-1');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 0, y: 0, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'compress-1', element: input, requestId: 'r1' });
+
+    const op = room.getOperationProcessor();
+    const el = room.getElementManager().getAllElements()[0];
+
+    for (let i = 1; i <= 20; i++) {
+      const currentEl = room.getElementManager().getElement(el.id)!;
+      const moveOp: MoveOperation = {
+        id: `op-${i}`, type: 'move', elementId: el.id,
+        dx: i, dy: i, newX: i, newY: i,
+        version: currentEl.version, userId: 'u1', timestamp: Date.now() + i * 10,
+      };
+      op.process(moveOp);
+    }
+
+    const beforeSize = op.getHistorySize();
+    assert.ok(beforeSize >= 20, `压缩前应有至少20条历史（实际${beforeSize}）`);
+
+    const result = op.compressHistory({ keyframeIntervalMs: 1000, keepMinOperations: 5 });
+    assert.strictEqual(typeof result.beforeSize, 'number', 'beforeSize是数字');
+    assert.strictEqual(typeof result.afterSize, 'number', 'afterSize是数字');
+    assert.strictEqual(typeof result.removedCount, 'number', 'removedCount是数字');
+    assert.strictEqual(result.beforeSize, beforeSize, 'beforeSize匹配');
+    assert.ok(result.removedCount >= 0, 'removedCount >= 0');
+    assert.strictEqual(result.afterSize, beforeSize - result.removedCount, '条数一致');
+
+    const afterSize = op.getHistorySize();
+    assert.strictEqual(afterSize, result.afterSize, '实际历史大小匹配');
+  });
+
+  runTest('压缩后仍能通过earliestTimestamp判断增量恢复范围', () => {
+    const room = createDummyRoom('compress-2');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 0, y: 0, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'compress-2', element: input, requestId: 'r1' });
+
+    const op = room.getOperationProcessor();
+    const el = room.getElementManager().getAllElements()[0];
+    const t1 = Date.now();
+
+    for (let i = 1; i <= 10; i++) {
+      const currentEl = room.getElementManager().getElement(el.id)!;
+      const moveOp: MoveOperation = {
+        id: `op-${i}`, type: 'move', elementId: el.id,
+        dx: i, dy: i, newX: i, newY: i,
+        version: currentEl.version, userId: 'u1', timestamp: t1 + i * 10,
+      };
+      op.process(moveOp);
+    }
+
+    op.compressHistory({ keyframeIntervalMs: 1000, keepMinOperations: 3 });
+
+    const earliest = op.getEarliestHistoryTimestamp();
+    const latest = op.getLatestHistoryTimestamp();
+
+    assert.ok(earliest > 0, '压缩后仍有最早时间');
+    assert.ok(latest > 0, '压缩后仍有最新时间');
+    assert.ok(latest >= earliest, '最新 >= 最早');
+    assert.ok(earliest <= t1 + 100, '最早时间应接近第一条操作');
+    assert.ok(latest >= t1 + 90, '最新时间应接近最后一条操作');
+  });
+
+  runTest('房间getStatus返回的historySize和时间戳与压缩后一致', () => {
+    const room = createDummyRoom('compress-3');
+    const vp: Viewport = { x: 0, y: 0, width: 1000, height: 1000, scale: 1 };
+    room.addUser('u1', 'Alice', vp);
+    const input: ElementCreateInput = { type: 'rectangle', x: 10, y: 10, width: 50, height: 50, fill: 'F' };
+    room.handleCreateElement('u1', { roomId: 'compress-3', element: input, requestId: 'r1' });
+
+    const statusBefore = room.getStatus();
+    const sizeBefore = statusBefore.historySize;
+
+    const op = room.getOperationProcessor();
+    op.compressHistory({ keyframeIntervalMs: 1000, keepMinOperations: 1 });
+
+    const statusAfter = room.getStatus();
+    assert.ok(statusAfter.historySize <= sizeBefore, '压缩后historySize不增加');
+    assert.strictEqual(statusAfter.historySize, op.getHistorySize(), 'status和op一致');
+    assert.ok(statusAfter.earliestHistoryTimestamp > 0, 'earliest有效');
+    assert.ok(statusAfter.latestHistoryTimestamp > 0, 'latest有效');
+  });
+}
+
+// ============================================
 // 汇总
 // ============================================
 console.log('\n=====================================================');
